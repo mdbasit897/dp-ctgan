@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 DP-CTGAN — Generalized Differentially-Private Tabular Synthesis Pipeline
-==========================================================================
+
 
 
 WHAT CHANGED FROM THE ORIGINAL 4 SCRIPTS
------------------------------------------
+
 - Engine (DPCTGAN / StableNVP flows / PrivacyGate / kNN-MIA / LR-MIA /
   Optuna tuning / postprocessing) is now ONE shared implementation, based
   on the most bug-fixed version of the four (the Adult-Census script):
@@ -18,7 +18,7 @@ WHAT CHANGED FROM THE ORIGINAL 4 SCRIPTS
   --target CLI call with auto-detection).
 
 HOW TO USE ON YOUR OWN DATASET
--------------------------------
+
 1. Easiest: just run
        python dp_ctgan_pipeline.py --data yourfile.csv --target your_label_col
    Categorical columns, log1p-worthy skewed columns, and ID columns are
@@ -81,9 +81,9 @@ torch.manual_seed(42)
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 0 ─ DATASET CONFIG  (EDIT THIS PER DATASET — or use --data/--target)
-# ══════════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class DatasetConfig:
@@ -163,9 +163,8 @@ DATASET_CONFIG = DATASET_PRESETS["adult"]
 HYPERPARAMS = Hyperparams()
 
 
-# ══════════════════════════════════════════════════════════════════════════
 #  SECTION 1 ─ GENERIC DATA LOADING
-# ══════════════════════════════════════════════════════════════════════════
+
 
 def _infer_categorical_columns(df: pd.DataFrame, target: str, max_card: int = 20) -> List[str]:
     cats = []
@@ -267,9 +266,8 @@ def load_dataset(cfg: DatasetConfig):
     return df, target, cat_cols
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 2 ─ UTILITIES
-# ══════════════════════════════════════════════════════════════════════════
 
 def _ensure_numeric(df, target):
     df = df.copy()
@@ -312,9 +310,8 @@ def _cuda_clear():
         torch.cuda.empty_cache()
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 3 ─ DISTRIBUTION METRICS + MIA + PRIVACY GATE
-# ══════════════════════════════════════════════════════════════════════════
 
 def compute_ks_js(real_df, synth_df, feat_cols, n_bins=50):
     ks_vals, js_vals = [], []
@@ -472,9 +469,8 @@ def privacy_realism_filter(synth_df, ref_df, feat_cols, desired_n=None, k=3,
     return out.reset_index(drop=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 4 ─ EVALUATION (RF + KNN downstream classifiers)
-# ══════════════════════════════════════════════════════════════════════════
 
 def eval_clf(X_tr, y_tr, X_te, y_te):
     if len(np.unique(y_tr)) < 2:
@@ -514,9 +510,8 @@ def tstr_eval(train_df, sc, X_te, y_te, feat, target):
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 5 ─ QUANTILE MATCHING + POSTPROCESSING
-# ══════════════════════════════════════════════════════════════════════════
 
 def quantile_match(synth_df, ref_df, feat_cols, blend, orig_df=None):
     matched = synth_df.copy()
@@ -561,9 +556,7 @@ def postprocess_synthetic(synth_df, ref_df, target_col, cat_cols, int_cols, hard
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════
 #  SECTION 6 ─ MODE NORMALIZER
-# ══════════════════════════════════════════════════════════════════════════
 
 class ModeNormalizer:
     def __init__(self, n_modes=4):
@@ -630,9 +623,8 @@ class ModeNormalizer:
         return pd.DataFrame(rows, columns=self.cont_cols_ + self.cat_cols_)
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 7 ─ GAN NETWORKS + STABLE NVP FLOW
-# ══════════════════════════════════════════════════════════════════════════
 
 class Generator(nn.Module):
     def __init__(self, latent_dim, cond_dim, data_dim, hidden=(256, 256)):
@@ -718,9 +710,7 @@ def _train_flow(flow, data_tensor, epochs, lr, device):
     flow.eval()
 
 
-# ══════════════════════════════════════════════════════════════════════════
 #  SECTION 8 ─ DP-CTGAN  (dataset-agnostic engine)
-# ══════════════════════════════════════════════════════════════════════════
 
 class DPCTGAN:
     """
@@ -1023,9 +1013,7 @@ class DPCTGAN:
         return df_sel
 
 
-# ══════════════════════════════════════════════════════════════════════════
 #  SECTION 9 ─ OPTUNA HYPERPARAMETER TUNING (optional, 2-stage: GAN + DP)
-# ══════════════════════════════════════════════════════════════════════════
 
 def target_cat_cols(df, feat_cols, target, max_card=20):
     return [c for c in feat_cols if c != target and df[c].nunique() <= max_card]
@@ -1079,9 +1067,7 @@ def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_
     return out_hp
 
 
-# ══════════════════════════════════════════════════════════════════════════
 #  SECTION 10 ─ END-TO-END PIPELINE
-# ══════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams = None,
                  tune: bool = False, n_optuna_trials: int = 8, out_dir: str = "output"):
@@ -1184,9 +1170,8 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     return metrics, combined_df
 
 
-# ══════════════════════════════════════════════════════════════════════════
+
 #  SECTION 11 ─ CLI
-# ══════════════════════════════════════════════════════════════════════════
 
 def main():
     p = argparse.ArgumentParser(description="Generalized DP-CTGAN pipeline — works on any tabular CSV.")
