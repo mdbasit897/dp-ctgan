@@ -6,6 +6,9 @@ One pipeline, any dataset. This merges four dataset-specific research scripts
 minority-class-aware "rare sampler" (normalizing flows), a nearest-neighbour
 PrivacyGate, and kNN-MIA / LR-MIA membership-inference evaluation.
 
+> **Reproducing the paper:** follow [RUNNING_EXPERIMENTS.md](RUNNING_EXPERIMENTS.md) (data download,
+> MIMIC-III via BigQuery, Google Cloud GPU VM, multi-seed grid, baselines, tables and figures).
+
 ## Quick start
 
 ```bash

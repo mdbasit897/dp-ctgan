@@ -1,7 +1,12 @@
-torch>=2.0
-opacus>=1.4
-numpy>=1.24
-pandas>=2.0
-scipy>=1.10
-scikit-learn>=1.3
-optuna>=3.3
+# Versions used for the smoke tests of this pipeline (Python 3.11).
+# On a GPU VM, the PyPI torch wheel includes the CUDA runtime; only the NVIDIA driver is needed.
+torch==2.14.1
+opacus==1.6.0
+numpy==2.4.6
+pandas==3.0.6
+scipy==1.17.1
+scikit-learn==1.9.1
+optuna==5.0.0
+matplotlib==3.11.2
+xlrd==2.0.2          # reading the Taiwan .xls file
+openpyxl==3.1.5

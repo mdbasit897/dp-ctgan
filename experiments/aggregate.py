@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Aggregate results/**/metrics.json into CSV files, LaTeX tables and significance tests.
+
+Outputs (results/summary/):
+  runs.csv                 one row per (method/config, dataset, epsilon, seed)
+  mean_std.csv             mean and std over seeds
+  tab_utility.tex          TRTR / common / combined utility (manuscript Table "utility")
+  tab_fidelity_privacy.tex fidelity + membership inference (manuscript Table "fidelity")
+  tab_ablation.tex         ablation table
+  tab_baselines.tex        ours vs baselines
+  tab_gate.tex             PrivacyGate keep / near-copy / outlier rates
+  tab_dp.tex               DP accounting (sigma, q, T, achieved epsilon, delta)
+  tab_confusion.tex        mean confusion matrices (RF, validation-selected threshold)
+  stats.txt                Wilcoxon signed-rank tests, combined vs common
+
+  python experiments/aggregate.py --results results
+"""
+import argparse
+import glob
+import json
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.stats import wilcoxon
+
+from common import DATASET_LABELS, DATASETS
+
+EPS_ORDER = ["nodp", "10", "3", "1"]
+EPS_TEX = {"nodp": "No-DP", "10": r"$\varepsilon=10$", "3": r"$\varepsilon=3$", "1": r"$\varepsilon=1$",
+           "5": r"$\varepsilon=5$"}
+
+
+def flat(block, prefix=""):
+    """Flatten the nested metrics of one config into {name: value}."""
+    out = {}
+    u = block.get("utility", {})
+    for clf in ("rf", "knn"):
+        for k, v in u.get(clf, {}).items():
+            out[f"{clf}_{k}"] = v
+    for k, v in block.get("fidelity", {}).items():
+        out[k] = v
+    pr = block.get("privacy", {})
+    for att in ("knn_mia", "domias"):
+        for k, v in pr.get(att, {}).items():
+            out[f"{att}_{k}"] = v
+    if "lr_mia" in pr:
+        out["lr_mia_auc"] = pr["lr_mia"].get("lr_mia_auc")
+        out["lr_mia_tpr@0.01"] = pr["lr_mia"].get("tpr_at_fpr_01")
+    if "dcr" in pr:
+        out["dcr_share"] = pr["dcr"]["share_closer_to_train"]
+    return out
+
+
+def eps_key(e):
+    return "nodp" if e is None else f"{float(e):g}"
+
+
+def collect(res):
+    rows = []
+    for f in glob.glob(os.path.join(res, "*", "eps*", "seed*", "metrics.json")):
+        if os.sep + "baselines" + os.sep in f:
+            continue
+        R = json.load(open(f))
+        m = R["meta"]
+        base = {"method": "ours", "dataset": m["dataset"], "eps": eps_key(m["epsilon"]), "seed": m["seed"],
+                "achieved_eps": m.get("achieved_epsilon"), **{f"dp_{k}": v for k, v in (m.get("dp") or {}).items()},
+                "total_min": R.get("timings_sec", {}).get("total", np.nan) / 60}
+        rows.append({**base, "config": "trtr", **flat({"utility": R["trtr"]})})
+        for c in ("common", "combined"):
+            rows.append({**base, "config": c, **flat(R[c])})
+        for name, blk in R.get("ablations", {}).items():
+            rows.append({**base, "config": f"abl:{name}", **flat(blk)})
+        for s, st in (R.get("privacy_gate") or {}).items():
+            if st:
+                rows.append({**base, "config": f"gate:{s}", **{f"gate_{k}": v for k, v in st.items()}})
+    for f in glob.glob(os.path.join(res, "baselines", "*", "*", "eps*", "seed*", "metrics.json")):
+        R = json.load(open(f))
+        m = R["meta"]
+        rows.append({"method": m["method"], "config": m["method"], "dataset": m["dataset"],
+                     "eps": eps_key(m["epsilon"]), "seed": m["seed"], **flat(R)})
+    return pd.DataFrame(rows)
+
+
+def ms(series, digits=3):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) == 0:
+        return "--"
+    if len(s) == 1:
+        return f"{s.iloc[0]:.{digits}f}"
+    return f"{s.mean():.{digits}f}$\\pm${s.std(ddof=1):.{digits}f}"
+
+
+def table(df, row_keys, cols, header, caption, label, bold_pairs=None):
+    lines = [r"\begin{table}[t]", r"\centering", f"\\caption{{{caption}}}", f"\\label{{{label}}}",
+             r"\small", r"\resizebox{\textwidth}{!}{%",
+             r"\begin{tabular}{ll" + "c" * len(cols) + "}", r"\toprule", header + r" \\", r"\midrule"]
+    prev_ds = None
+    for ds, eps, cfg, label_txt in row_keys:
+        sub = df[(df.dataset == ds) & (df.eps == eps) & (df.config == cfg)]
+        if sub.empty:
+            continue
+        if prev_ds is not None and ds != prev_ds:
+            lines.append(r"\midrule")
+        cells = []
+        for c in cols:
+            txt = ms(sub[c]) if c in sub else "--"
+            if bold_pairs and cfg in bold_pairs and c in sub:
+                other = df[(df.dataset == ds) & (df.eps == eps) & (df.config == bold_pairs[cfg])]
+                if c in other and not other.empty:
+                    a, b = sub[c].mean(), other[c].mean()
+                    lower_better = c in LOWER_BETTER
+                    if (a < b) if lower_better else (a > b):
+                        txt = r"\textbf{" + txt + "}"
+            cells.append(txt)
+        name = DATASET_LABELS.get(ds, ds) if ds != prev_ds else ""
+        lines.append(f"{name} & {label_txt} & " + " & ".join(cells) + r" \\")
+        prev_ds = ds
+    lines += [r"\bottomrule", r"\end{tabular}}", r"\end{table}"]
+    return "\n".join(lines)
+
+
+LOWER_BETTER = {"ks", "js", "ks_minority", "js_minority", "corr_diff", "disc_auc", "knn_mia_auc", "domias_auc",
+                "lr_mia_auc", "domias_tpr@0.01", "knn_mia_tpr@0.01", "dcr_share"}
+
+
+def eps_list(df, ds):
+    present = df[df.dataset == ds].eps.unique().tolist()
+    return [e for e in EPS_ORDER if e in present] + sorted(set(present) - set(EPS_ORDER))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results", default="results")
+    ap.add_argument("--ablation-eps", default="3")
+    a = ap.parse_args()
+    out = os.path.join(a.results, "summary")
+    os.makedirs(out, exist_ok=True)
+    df = collect(a.results)
+    if df.empty:
+        raise SystemExit("no metrics.json found")
+    df.to_csv(os.path.join(out, "runs.csv"), index=False)
+    num = df.select_dtypes("number").columns.drop("seed", errors="ignore")
+    g = df.groupby(["method", "config", "dataset", "eps"])[list(num)]
+    pd.concat({"mean": g.mean(), "std": g.std(), "n": g.count()}, axis=1).to_csv(os.path.join(out, "mean_std.csv"))
+    datasets = [d for d in DATASETS if d in df.dataset.unique()]
+    pair = {"combined": "common", "common": "combined"}
+
+    # utility
+    keys = []
+    for ds in datasets:
+        e0 = eps_list(df, ds)[0]
+        keys.append((ds, e0, "trtr", "TRTR"))
+        for e in eps_list(df, ds):
+            keys += [(ds, e, "common", f"{EPS_TEX.get(e, e)}, common"), (ds, e, "combined", f"{EPS_TEX.get(e, e)}, combined")]
+    cols = ["rf_auc", "rf_auprc", "rf_f1", "knn_auc", "knn_auprc", "knn_f1"]
+    hdr = r"Dataset & Configuration & RF AUC & RF AUPRC & RF F1 & $k$-NN AUC & $k$-NN AUPRC & $k$-NN F1"
+    open(os.path.join(out, "tab_utility.tex"), "w").write(table(
+        df[df.method == "ours"], keys, cols, hdr,
+        "TSTR utility on the sealed test sets (mean $\\pm$ std over seeds). F1 at the threshold that maximizes F1 "
+        "on the validation split. Bold: better of common and combined.", "tab:utility", pair))
+
+    # fidelity + privacy
+    keys = [k for k in keys if k[2] != "trtr"]
+    cols = ["ks", "js", "corr_diff", "disc_auc", "knn_mia_auc", "domias_auc", "domias_tpr@0.01", "lr_mia_auc",
+            "dcr_share"]
+    hdr = (r"Dataset & Configuration & KS & JS & Corr.\ diff. & Disc.\ AUC & kNN-MIA AUC & DOMIAS AUC & "
+           r"DOMIAS TPR@1\% & LR-MIA AUC & DCR share")
+    open(os.path.join(out, "tab_fidelity_privacy.tex"), "w").write(table(
+        df[df.method == "ours"], keys, cols, hdr,
+        "Fidelity (lower is better) and membership inference (AUC 0.5 and DCR share 0.5 = no measurable leakage); "
+        "mean $\\pm$ std over seeds.", "tab:fidelity", pair))
+
+    # ablation
+    abl = df[(df.method == "ours") & (df.eps == a.ablation_eps)]
+    variants = [("common", "Common only"), ("abl:plain_oversample", r"+ plain $G(z,c_{\min})$ samples"),
+                ("abl:no_flow_refine", "w/o flow scoring + refinement"), ("abl:no_refine", "w/o refinement (Stage 3)"),
+                ("abl:no_judge", "w/o classifier judge"), ("abl:no_maxmin", "w/o diversity selection"),
+                ("abl:no_qm", "w/o quantile matching"), ("combined", "Full sampler")]
+    lines = [r"\begin{table}[t]", r"\centering",
+             f"\\caption{{Ablation of the rare-minority sampler at {EPS_TEX.get(a.ablation_eps, a.ablation_eps)} "
+             r"(RF AUPRC, mean $\pm$ std over seeds; every variant adds the same number of minority records).}",
+             r"\label{tab:ablation}", r"\small", r"\begin{tabular}{l" + "c" * len(datasets) + "}", r"\toprule",
+             "Variant & " + " & ".join(DATASET_LABELS[d] for d in datasets) + r" \\", r"\midrule"]
+    for cfg, txt in variants:
+        lines.append(txt + " & " + " & ".join(ms(abl[(abl.dataset == d) & (abl.config == cfg)]["rf_auprc"])
+                                               for d in datasets) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    open(os.path.join(out, "tab_ablation.tex"), "w").write("\n".join(lines))
+
+    # baselines
+    meths = [m for m in df.method.unique() if m != "ours"]
+    if meths:
+        keys = []
+        for ds in datasets:
+            for e in eps_list(df, ds):
+                keys.append((ds, e, "combined", f"{EPS_TEX.get(e, e)}, ours"))
+                keys += [(ds, e, m, f"{EPS_TEX.get(e, e)}, {m}") for m in meths]
+        open(os.path.join(out, "tab_baselines.tex"), "w").write(table(
+            df, keys, ["rf_auc", "rf_auprc", "rf_f1", "ks", "domias_auc", "dcr_share"],
+            r"Dataset & Setting & RF AUC & RF AUPRC & RF F1 & KS & DOMIAS AUC & DCR share",
+            "Comparison with baselines on identical splits and evaluation (mean $\\pm$ std over seeds). "
+            "Non-private methods (ctgan, tvae, smote) are listed under No-DP.", "tab:baselines"))
+
+    # PrivacyGate and DP accounting
+    lines = [r"\begin{table}[t]", r"\centering", r"\caption{PrivacyGate statistics (fraction of candidate records "
+             r"kept, removed as near-copies, removed as outliers; mean over seeds).}", r"\label{tab:gate}", r"\small",
+             r"\begin{tabular}{llcccccc}", r"\toprule",
+             r" & & \multicolumn{3}{c}{Common stream} & \multicolumn{3}{c}{Rare stream} \\",
+             r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}",
+             r"Dataset & Setting & Keep & Near-copy & Outlier & Keep & Near-copy & Outlier \\", r"\midrule"]
+    gate = df[df.config.str.startswith("gate:")]
+    for ds in datasets:
+        for e in eps_list(df, ds):
+            c = gate[(gate.dataset == ds) & (gate.eps == e) & (gate.config == "gate:common")]
+            r = gate[(gate.dataset == ds) & (gate.eps == e) & (gate.config == "gate:rare")]
+            if c.empty:
+                continue
+            f = lambda s, k: f"{pd.to_numeric(s[k]).mean():.3f}" if k in s and not s.empty else "--"
+            lines.append(f"{DATASET_LABELS[ds]} & {EPS_TEX.get(e, e)} & " + " & ".join(
+                [f(c, "gate_keep_rate"), f(c, "gate_near_copy_rate"), f(c, "gate_outlier_rate"),
+                 f(r, "gate_keep_rate"), f(r, "gate_near_copy_rate"), f(r, "gate_outlier_rate")]) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
+    open(os.path.join(out, "tab_gate.tex"), "w").write("\n".join(lines))
+
+    dp = df[(df.config == "combined") & (df.eps != "nodp")]
+    lines = [r"\begin{tabular}{llccccc}", r"\toprule",
+             r"Dataset & Target $\varepsilon$ & $\delta$ & $\sigma$ & $q$ & $T$ & Achieved $\varepsilon$ \\", r"\midrule"]
+    for (ds, e), s in dp.groupby(["dataset", "eps"]):
+        g_ = lambda k, fmt: (fmt.format(pd.to_numeric(s[k]).mean()) if k in s else "--")
+        lines.append(f"{DATASET_LABELS[ds]} & {e} & {g_('dp_delta', '{:.1e}')} & {g_('dp_noise_multiplier', '{:.3f}')} "
+                     f"& {g_('dp_sample_rate', '{:.4f}')} & {g_('dp_steps_done', '{:.0f}')} & "
+                     f"{g_('achieved_eps', '{:.3f}')} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    open(os.path.join(out, "tab_dp.tex"), "w").write("\n".join(lines))
+
+    # confusion matrices (mean counts over seeds)
+    lines = [r"\begin{tabular}{llrrrrccc}", r"\toprule",
+             r"Dataset & Configuration & TN & FP & FN & TP & Precision & Recall & F1 \\", r"\midrule"]
+    for ds in datasets:
+        for e in eps_list(df, ds):
+            for cfg in (["trtr"] if e == eps_list(df, ds)[0] else []) + ["common", "combined"]:
+                s = df[(df.method == "ours") & (df.dataset == ds) & (df.eps == e) & (df.config == cfg)]
+                if s.empty:
+                    continue
+                lab = "TRTR" if cfg == "trtr" else f"{EPS_TEX.get(e, e)}, {cfg}"
+                lines.append(f"{DATASET_LABELS[ds]} & {lab} & " + " & ".join(
+                    f"{s[f'rf_{k}'].mean():,.0f}" for k in ("tn", "fp", "fn", "tp")) + " & " + " & ".join(
+                    ms(s[f"rf_{k}"]) for k in ("precision", "recall", "f1")) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    open(os.path.join(out, "tab_confusion.tex"), "w").write("\n".join(lines))
+
+    # significance: combined vs common, paired over (dataset, eps, seed)
+    ours = df[df.method == "ours"]
+    a_ = ours[ours.config == "combined"].set_index(["dataset", "eps", "seed"])
+    b_ = ours[ours.config == "common"].set_index(["dataset", "eps", "seed"])
+    common_idx = a_.index.intersection(b_.index)
+    rep = ["Wilcoxon signed-rank test, combined vs common, paired over (dataset, eps, seed)", ""]
+    for m in ["rf_auc", "rf_auprc", "rf_f1", "knn_auc", "knn_auprc", "knn_f1", "ks", "js", "domias_auc", "lr_mia_auc"]:
+        if m not in a_:
+            continue
+        x = pd.to_numeric(a_.loc[common_idx, m]); y = pd.to_numeric(b_.loc[common_idx, m])
+        d = (x - y).dropna()
+        if len(d) < 6 or (d == 0).all():
+            continue
+        p = wilcoxon(d).pvalue
+        rep.append(f"{m:12s} n={len(d):3d}  mean diff={d.mean():+.4f}  combined better in "
+                   f"{(d < 0).sum() if m in LOWER_BETTER else (d > 0).sum()}/{len(d)}  p={p:.2e}")
+        for ds in datasets:
+            dd = d.xs(ds, level="dataset") if ds in d.index.get_level_values(0) else pd.Series(dtype=float)
+            if len(dd) >= 6 and not (dd == 0).all():
+                rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={wilcoxon(dd).pvalue:.2e}")
+    open(os.path.join(out, "stats.txt"), "w").write("\n".join(rep) + "\n")
+    print("\n".join(rep))
+    print(f"\nwrote tables and CSVs to {out}/")
+
+
+if __name__ == "__main__":
+    main()

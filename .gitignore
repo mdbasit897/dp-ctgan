@@ -1,0 +1,14 @@
+# data (MIMIC-III must never be committed: PhysioNet DUA)
+data/*.csv
+data/*.csv.gz
+data/_kaggle_tmp/
+# experiment outputs
+results/
+output/
+logs/
+*.npz
+# environments
+.venv/
+venv*/
+__pycache__/
+*.pyc

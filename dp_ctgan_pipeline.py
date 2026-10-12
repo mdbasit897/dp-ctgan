@@ -1,50 +1,43 @@
 #!/usr/bin/env python3
 """
-DP-CTGAN — Generalized Differentially-Private Tabular Synthesis Pipeline
+DP-CTGAN (RareFlow-DP) — Differentially-Private Tabular Synthesis Pipeline
 
+One shared engine for every dataset:
+  * ModeNormalizer (GMM mode-specific encoding)
+  * Conditional generator + discriminator; the discriminator is trained with
+    DP-SGD (Opacus, RDP accountant) when an epsilon is given
+  * Minority-aware generator objective: adversarial + feature matching (FM)
+    + minority moment matching (MM) + minority correlation matching (corr)
+    + minority feature matching (MFM), followed by minority fine-tuning
+  * Rare-minority sampler in the generator's hidden space:
+      Stage 1 pool generation -> Stage 2 StableNVP likelihood-ratio scoring
+      -> Stage 3 latent refinement -> Stage 4 RF judge -> Stage 5 greedy
+      MaxMin diversity -> Stage 6 partial quantile matching (applied by caller)
+  * PrivacyGate near-copy / outlier filter
+  * kNN-MIA / LR-MIA evaluation
 
+PRIVACY SCOPE: epsilon bounds the discriminator's DP-SGD updates only. The
+generator's FM/MM/corr/MFM losses, fine-tuning, the encoder, the RF judge,
+quantile matching and the PrivacyGate read real data outside the accountant,
+so the released data is NOT end-to-end (epsilon, delta)-DP. See the
+"Privacy Scope" section of the manuscript.
 
-WHAT CHANGED FROM THE ORIGINAL 4 SCRIPTS
-
-- Engine (DPCTGAN / StableNVP flows / PrivacyGate / kNN-MIA / LR-MIA /
-  Optuna tuning / postprocessing) is now ONE shared implementation, based
-  on the most bug-fixed version of the four (the Adult-Census script):
-    * MIA train/holdout split has no leakage (test set is sealed).
-    * LR-MIA shadow labels come from the synthetic data itself (unbiased).
-    * refine_steps resolution bug fixed.
-- Everything that used to be dataset-specific (file path, target column,
-  categorical columns, log1p columns, ID/leakage columns, numeric bounds)
-  now lives in ONE place: the DATASET_CONFIG dict below (or a --data /
-  --target CLI call with auto-detection).
-
-HOW TO USE ON YOUR OWN DATASET
-
-1. Easiest: just run
-       python dp_ctgan_pipeline.py --data yourfile.csv --target your_label_col
-   Categorical columns, log1p-worthy skewed columns, and ID columns are
-   auto-detected. This works for most CSVs out of the box.
-
-2. For more control (recommended for anything you'll publish results on),
-   edit DATASET_CONFIG below, or add your own preset to DATASET_PRESETS,
-   then run:
-       python dp_ctgan_pipeline.py --preset your_dataset_name --epsilon 3
-
-3. Every knob that used to require editing model internals is now a
-   parameter on DATASET_CONFIG or in HYPERPARAMS — see the dataclasses
-   below for the full list.
-
-Run `python dp_ctgan_pipeline.py --help` for all CLI options.
+Quick use:
+    python dp_ctgan_pipeline.py --preset adult --epsilon 3
+    python dp_ctgan_pipeline.py --data yourfile.csv --target label --epsilon none
+For the full multi-seed experiment grid used in the paper see
+experiments/run_experiments.py and RUNNING_EXPERIMENTS.md.
 """
 
-import os, sys, warnings, time, math, argparse, json
-warnings.filterwarnings("ignore")
+import os, sys, warnings, time, math, argparse, json, copy
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict, Any, Callable
-from collections import defaultdict
+from typing import Optional, List, Dict, Callable
 from scipy.stats import rankdata, ks_2samp
 from scipy.spatial.distance import jensenshannon
 
@@ -54,16 +47,18 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from opacus import PrivacyEngine
-from opacus.validators import ModuleValidator
+try:  # only needed for DP training; lazy so that baseline environments can import this module
+    from opacus import PrivacyEngine
+    from opacus.validators import ModuleValidator
+except Exception:  # pragma: no cover
+    PrivacyEngine = ModuleValidator = None
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, average_precision_score,
-    precision_recall_curve, roc_curve, f1_score,
-    precision_score, recall_score, balanced_accuracy_score,
+    roc_auc_score, average_precision_score, roc_curve, f1_score,
+    precision_score, recall_score,
 )
 from sklearn.neighbors import NearestNeighbors, KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
@@ -76,95 +71,166 @@ try:
 except ModuleNotFoundError:
     optuna = None
 
-np.random.seed(42)
-torch.manual_seed(42)
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def set_seed(seed: int):
+    """Seed numpy, torch and python RNGs (call once per experiment run)."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-#  SECTION 0 ─ DATASET CONFIG  (EDIT THIS PER DATASET — or use --data/--target)
 
+set_seed(42)
+
+
+#  SECTION 0 ─ DATASET CONFIG
 
 @dataclass
 class DatasetConfig:
     name: str
     path: str
-    target_col: Optional[str] = None                  # exact column name if known
-    target_candidates: List[str] = field(default_factory=list)  # tried in order if target_col not found
+    target_col: Optional[str] = None
+    target_candidates: List[str] = field(default_factory=list)
     positive_labels: List[str] = field(default_factory=lambda: ["1", "1.0", "true", "yes", ">50k"])
-    id_cols: List[str] = field(default_factory=list)   # dropped unconditionally (IDs, free text, leakage)
-    cat_cols: Optional[List[str]] = None               # None = auto-infer (nunique <= 20 & non-numeric or low-card numeric)
-    log1p_cols: List[str] = field(default_factory=list)  # skewed numeric columns to log1p
-    int_cols: List[str] = field(default_factory=list)  # columns to round to int after synthesis
-    hard_bounds: Dict[str, tuple] = field(default_factory=dict)  # {"age": (17, 90)}
-    drop_high_corr_threshold: Optional[float] = 0.95   # auto-drop columns this correlated with target (leakage guard)
-    custom_clean_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None  # optional extra cleaning hook
+    id_cols: List[str] = field(default_factory=list)       # dropped unconditionally (IDs, free text, leakage)
+    cat_cols: Optional[List[str]] = None                   # None = auto-infer
+    log1p_cols: List[str] = field(default_factory=list)    # log(1+x) after clipping at 0
+    signed_log1p_cols: List[str] = field(default_factory=list)  # sign(x)*log(1+|x|) (keeps negative values)
+    int_cols: List[str] = field(default_factory=list)      # rounded after synthesis (raw-scale columns only)
+    hard_bounds: Dict[str, tuple] = field(default_factory=dict)
+    max_rows: Optional[int] = None                         # subsample majority so len(df)=max_rows; keeps all minority rows
+    drop_high_corr_threshold: Optional[float] = 0.95
+    custom_clean_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
 
 
 @dataclass
 class Hyperparams:
+    # GAN
     gan_epochs: int = 60
-    flow_epochs: int = 60
     latent_dim: int = 128
     hidden_dim: int = 256
     batch_size: int = 512
     gen_lr: float = 2e-4
     disc_lr: float = 2e-4
     dp_max_grad_norm: float = 5.0
-    finetune_epochs: int = 15
+    delta: Optional[float] = None            # None -> min(1e-5, 1/(10 n_train))
     r1_gamma: float = 5.0
-    minority_batch_frac: float = 0.5
+    minority_batch_frac: float = 0.5         # class balance of the real batch used for the generator's matching losses
+    lambda_fm: float = 1.0
+    lambda_mm: float = 2.0
+    lambda_corr: float = 1.0
+    lambda_mfm: float = 1.0
+    corr_warmup_frac: float = 0.3            # L_corr switched on after this fraction of epochs
+    finetune_epochs: int = 20
+    finetune_steps_per_epoch: int = 10
+    finetune_patience: int = 5
+    # flows (Stage 2)
+    flow_epochs: int = 60
+    flow_layers: int = 6
+    flow_hidden: int = 128
+    flow_lr: float = 2e-4
+    flow_n_samples: int = 8000
+    # rare sampler (Stages 1-5)
+    rare_multiplier: float = 1.5             # n_rare = max(200, rare_multiplier * n_real_minority)
+    rare_pool_size: int = 20000
+    rare_max_iters: int = 30
+    refine_top_frac: float = 0.25
+    refine_steps: int = 50
+    refine_lr: float = 0.01
+    judge_keep_frac: float = 0.40
+    judge_min_prob: float = 0.05
+    # Stage 6 + filters
     quantile_blend: float = 0.35
+    privacy_filter_enabled: bool = True
+    privacy_max_ref: int = 2000
+    # evaluation
+    knn_k: int = 5
     test_split: float = 0.20
     final_mia_holdout_frac: float = 0.10
-    rare_multiplier: float = 1.5            # how many synthetic minority rows to generate, relative to real count
-    privacy_filter_enabled: bool = True
 
 
-# ── Example presets — edit paths, or add your own dataset here ─────────────
+DATA_DIR = os.environ.get("DPCTGAN_DATA_DIR", "data")
+
 DATASET_PRESETS: Dict[str, DatasetConfig] = {
     "adult": DatasetConfig(
-        name="adult", path="adult.csv", target_col="income",
+        name="adult", path=os.path.join(DATA_DIR, "adult.csv"), target_col="income",
         target_candidates=["income", "income_>50K"],
         id_cols=["fnlwgt"],
         cat_cols=["workclass", "education", "marital-status", "occupation",
                   "relationship", "race", "sex", "native-country"],
         log1p_cols=["capital-gain", "capital-loss"],
-        int_cols=["age", "education-num", "hours-per-week", "capital-gain", "capital-loss"],
+        int_cols=["age", "education-num", "hours-per-week"],
         hard_bounds={"age": (17, 90), "education-num": (1, 16), "hours-per-week": (1, 99)},
     ),
     "taiwan_credit": DatasetConfig(
-        name="taiwan_credit", path="UCI_Credit_Card.csv", target_col="default",
+        name="taiwan_credit", path=os.path.join(DATA_DIR, "UCI_Credit_Card.csv"),
+        target_col="default.payment.next.month",
         target_candidates=["default.payment.next.month", "default", "Y"],
         id_cols=["ID"],
         cat_cols=["SEX", "EDUCATION", "MARRIAGE", "PAY_0", "PAY_2", "PAY_3",
                   "PAY_4", "PAY_5", "PAY_6"],
-        log1p_cols=[f"BILL_AMT{i}" for i in range(1, 7)] + [f"PAY_AMT{i}" for i in range(1, 7)],
+        log1p_cols=[f"PAY_AMT{i}" for i in range(1, 7)],
+        signed_log1p_cols=[f"BILL_AMT{i}" for i in range(1, 7)],
         int_cols=["AGE", "LIMIT_BAL"],
         hard_bounds={"AGE": (21, 79), "LIMIT_BAL": (10_000, 1_000_000)},
     ),
     "credit_fraud": DatasetConfig(
-        name="credit_fraud", path="creditcard.csv", target_col="Class",
+        name="credit_fraud", path=os.path.join(DATA_DIR, "creditcard.csv"), target_col="Class",
         target_candidates=["Class", "class", "target"],
-        cat_cols=[],  # all continuous (PCA components)
+        cat_cols=[],
         log1p_cols=["Amount", "Time"],
+        max_rows=100_000,   # all 492 frauds + 99,508 legitimate (as in the paper); set None for all 284,807
     ),
     "mimic3": DatasetConfig(
-        name="mimic3", path="final_dataset.csv", target_col="MORTALITY",
+        name="mimic3", path=os.path.join(DATA_DIR, "mimic3.csv"), target_col="MORTALITY",
         id_cols=["ROW_ID", "SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "DIAGNOSIS",
                  "EXPIRE_FLAG", "PRIMARY_ICD9", "DISCHARGE_LOCATION", "DEATHTIME",
                  "DOD", "HOSPITAL_EXPIRE_FLAG", "LANGUAGE", "ETHNICITY", "RELIGION"],
+        cat_cols=["GENDER", "ADMISSION_TYPE", "INSURANCE", "MARITAL_STATUS", "FIRST_CAREUNIT"],
         log1p_cols=["HOSPITAL_LOS", "ICU_LOS", "NUM_DIAGNOSES", "NUM_PROCEDURES", "ICU_STAYS"],
+        int_cols=["AGE"],
+        hard_bounds={"AGE": (18, 90)},
     ),
 }
 
-# Active config for a direct `python dp_ctgan_pipeline.py` run with no CLI args.
+# Per-dataset defaults from the manuscript's hyperparameter table (Appendix A).
+HP_PRESETS: Dict[str, Dict] = {
+    "adult": dict(gan_epochs=80, dp_max_grad_norm=5.0, r1_gamma=5.0, finetune_patience=8,
+                  rare_pool_size=30000, rare_max_iters=30, flow_hidden=128,
+                  refine_top_frac=0.25, refine_steps=50, refine_lr=0.010,
+                  judge_keep_frac=0.40, judge_min_prob=0.05, quantile_blend=0.35, privacy_max_ref=2000),
+    "taiwan_credit": dict(gan_epochs=80, dp_max_grad_norm=5.0, r1_gamma=10.0, finetune_patience=8,
+                          rare_pool_size=30000, rare_max_iters=8, flow_hidden=128,
+                          refine_top_frac=0.15, refine_steps=40, refine_lr=0.010,
+                          judge_keep_frac=0.40, judge_min_prob=0.05, quantile_blend=0.35, privacy_max_ref=8000),
+    "credit_fraud": dict(gan_epochs=50, dp_max_grad_norm=1.0, r1_gamma=10.0, finetune_patience=5,
+                         rare_pool_size=20000, rare_max_iters=30, flow_hidden=256,
+                         refine_top_frac=0.25, refine_steps=50, refine_lr=0.012,
+                         judge_keep_frac=0.25, judge_min_prob=0.01, quantile_blend=0.30, privacy_max_ref=2000),
+    "mimic3": dict(gan_epochs=100, dp_max_grad_norm=1.0, r1_gamma=10.0, finetune_patience=5,
+                   rare_pool_size=20000, rare_max_iters=30, flow_hidden=256,
+                   refine_top_frac=0.25, refine_steps=50, refine_lr=0.012,
+                   judge_keep_frac=0.25, judge_min_prob=0.01, quantile_blend=0.35, privacy_max_ref=2000),
+}
+
+
+def hyperparams_for(dataset: str, overrides: Optional[Dict] = None) -> Hyperparams:
+    hp = Hyperparams(**HP_PRESETS.get(dataset, {}))
+    for k, v in (overrides or {}).items():
+        if hasattr(hp, k):
+            setattr(hp, k, v)
+    return hp
+
+
 DATASET_CONFIG = DATASET_PRESETS["adult"]
 HYPERPARAMS = Hyperparams()
 
 
 #  SECTION 1 ─ GENERIC DATA LOADING
-
 
 def _infer_categorical_columns(df: pd.DataFrame, target: str, max_card: int = 20) -> List[str]:
     cats = []
@@ -184,7 +250,6 @@ def _encode_binary_target(series: pd.Series, positive_labels: List[str]) -> pd.S
     mask = norm.isin(pos)
     if mask.sum() > 0:
         return mask.astype(int)
-    # fall back: numeric already 0/1, or pick the minority class as positive
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.notna().all() and set(numeric.unique()) <= {0, 1}:
         return numeric.astype(int)
@@ -193,15 +258,15 @@ def _encode_binary_target(series: pd.Series, positive_labels: List[str]) -> pd.S
     return (norm == minority_label).astype(int)
 
 
-def load_dataset(cfg: DatasetConfig):
+def load_dataset(cfg: DatasetConfig, verbose: bool = True):
     """Load + clean any CSV according to a DatasetConfig. Returns (df, target, cat_cols)."""
     if not os.path.exists(cfg.path):
-        raise FileNotFoundError(f"Dataset not found at '{cfg.path}'. Edit DatasetConfig.path.")
+        raise FileNotFoundError(f"Dataset not found at '{cfg.path}'. Run data/prepare_public_datasets.py "
+                                f"(or data/prepare_mimic3.py) or edit DatasetConfig.path.")
 
     df = pd.read_csv(cfg.path)
     df.columns = df.columns.str.strip()
 
-    # target detection
     target = cfg.target_col
     if target is None or target not in df.columns:
         for cand in cfg.target_candidates:
@@ -209,45 +274,50 @@ def load_dataset(cfg: DatasetConfig):
                 target = cand
                 break
     if target is None or target not in df.columns:
-        raise ValueError(
-            f"Could not find target column. Tried {cfg.target_col!r} and "
-            f"{cfg.target_candidates}. Available columns: {list(df.columns)}")
+        raise ValueError(f"Could not find target column. Tried {cfg.target_col!r} and "
+                         f"{cfg.target_candidates}. Available columns: {list(df.columns)}")
 
-    # drop ID / free-text / leakage columns
-    drop_cols = [c for c in cfg.id_cols if c in df.columns]
+    drop_cols = [c for c in cfg.id_cols if c in df.columns and c != target]
     if drop_cols:
         df = df.drop(columns=drop_cols)
-        print(f"  [load] dropped ID/leakage columns: {drop_cols}")
+        if verbose:
+            print(f"  [load] dropped ID/leakage columns: {drop_cols}")
 
-    # clean missing values
+    n_before = len(df)
     df = df.replace({"?": np.nan, "": np.nan}).dropna().reset_index(drop=True)
+    if verbose and len(df) < n_before:
+        print(f"  [load] dropped {n_before - len(df):,} rows with missing values")
 
-    # encode target as binary 0/1
     df[target] = _encode_binary_target(df[target], cfg.positive_labels)
 
-    # categorical columns: explicit list or auto-infer
+    if cfg.max_rows is not None and len(df) > cfg.max_rows:
+        pos = df[df[target] == 1]
+        neg = df[df[target] == 0].sample(n=max(cfg.max_rows - len(pos), 0), random_state=0)
+        df = pd.concat([pos, neg]).sample(frac=1, random_state=0).reset_index(drop=True)
+        if verbose:
+            print(f"  [load] subsampled majority class to {len(df):,} rows (all {len(pos):,} minority kept)")
+
     cat_cols = cfg.cat_cols if cfg.cat_cols is not None else _infer_categorical_columns(df, target)
     cat_cols = [c for c in cat_cols if c in df.columns]
     for c in cat_cols:
         df[c] = pd.Categorical(df[c].astype(str).str.strip()).codes
 
-    # log1p skewed numeric columns
     for c in cfg.log1p_cols:
         if c in df.columns:
             df[c] = np.log1p(pd.to_numeric(df[c], errors="coerce").fillna(0).clip(lower=0))
+    for c in cfg.signed_log1p_cols:
+        if c in df.columns:
+            v = pd.to_numeric(df[c], errors="coerce").fillna(0)
+            df[c] = np.sign(v) * np.log1p(np.abs(v))
 
-    # everything else numeric
     for c in df.columns:
         if c == target:
             continue
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # optional custom hook for dataset-specific cleaning (unit fixes, physiological
-    # clipping, etc.) that doesn't fit the generic config knobs above
     if cfg.custom_clean_fn is not None:
         df = cfg.custom_clean_fn(df)
 
-    # leakage guard: warn (don't silently drop) on suspiciously high correlation with target
     if cfg.drop_high_corr_threshold is not None:
         for c in df.columns:
             if c == target:
@@ -261,10 +331,10 @@ def load_dataset(cfg: DatasetConfig):
                 pass
 
     n_pos = int(df[target].sum())
-    print(f"  [load] {cfg.name}: rows={len(df):,}  positive={n_pos:,} "
-          f"({n_pos/len(df)*100:.2f}%)  features={df.shape[1]-1}  cat_cols={len(cat_cols)}")
+    if verbose:
+        print(f"  [load] {cfg.name}: rows={len(df):,}  positive={n_pos:,} "
+              f"({n_pos/len(df)*100:.2f}%)  features={df.shape[1]-1}  cat_cols={len(cat_cols)}")
     return df, target, cat_cols
-
 
 
 #  SECTION 2 ─ UTILITIES
@@ -279,14 +349,14 @@ def _ensure_numeric(df, target):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df
 
+
 def _rank_norm(x):
     return (rankdata(x, method='average') - 1) / max(len(x) - 1, 1)
 
-def _cosine_sim_matrix(A, b):
-    A_n = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
-    return A_n @ (b / (np.linalg.norm(b) + 1e-8))
 
 def greedy_maxmin_pca(arr, k, scores=None, pca_k=32):
+    """Greedy farthest-point (MaxMin) selection in a PCA-whitened space.
+    Starts from the highest-scoring point; runs on GPU when available."""
     N = len(arr)
     if k >= N:
         return np.arange(N)
@@ -295,25 +365,34 @@ def greedy_maxmin_pca(arr, k, scores=None, pca_k=32):
                     whiten=True, random_state=42).fit_transform(arr)
     except Exception:
         arr_w = arr
+    X = torch.tensor(np.asarray(arr_w, dtype=np.float32), device=DEVICE)
     seed = int(np.argmax(scores)) if scores is not None else 0
     selected = [seed]
-    min_dists = np.full(N, np.inf)
+    min_d = torch.full((N,), float("inf"), device=DEVICE)
     for _ in range(k - 1):
-        dists = np.linalg.norm(arr_w - arr_w[selected[-1]], axis=1)
-        min_dists = np.minimum(min_dists, dists)
-        min_dists[selected] = -1
-        selected.append(int(np.argmax(min_dists)))
+        d = torch.linalg.vector_norm(X - X[selected[-1]], dim=1)
+        min_d = torch.minimum(min_d, d)
+        min_d[selected[-1]] = -1.0
+        selected.append(int(torch.argmax(min_d).item()))
     return np.array(selected)
+
 
 def _cuda_clear():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
+def _torch_corr(x):
+    xc = x - x.mean(0, keepdim=True)
+    cov = xc.T @ xc / max(x.shape[0] - 1, 1)
+    std = torch.sqrt(torch.clamp(torch.diag(cov), min=1e-8))
+    return cov / (std[:, None] * std[None, :])
+
 
 #  SECTION 3 ─ DISTRIBUTION METRICS + MIA + PRIVACY GATE
 
 def compute_ks_js(real_df, synth_df, feat_cols, n_bins=50):
+    """Mean KS statistic and mean Jensen-Shannon DISTANCE (scipy, base e) over features."""
     ks_vals, js_vals = [], []
     for c in feat_cols:
         if c not in real_df.columns or c not in synth_df.columns:
@@ -348,9 +427,9 @@ def membership_inference_attack(train_df, holdout_df, synth_df, feat_cols, n_eva
     X_mem = sc.transform(train_s[feat_cols].values.astype(float))
     X_non = sc.transform(holdout_s[feat_cols].values.astype(float))
     kk = min(k, max(1, len(X_synth) - 1))
-    nn = NearestNeighbors(n_neighbors=kk, n_jobs=-1).fit(X_synth)
-    d_mem, _ = nn.kneighbors(X_mem)
-    d_non, _ = nn.kneighbors(X_non)
+    nn_ = NearestNeighbors(n_neighbors=kk, n_jobs=-1).fit(X_synth)
+    d_mem, _ = nn_.kneighbors(X_mem)
+    d_non, _ = nn_.kneighbors(X_non)
     y_true = np.concatenate([np.ones(len(d_mem)), np.zeros(len(d_non))])
     y_score = np.concatenate([-d_mem.mean(1), -d_non.mean(1)])
     try:
@@ -361,11 +440,14 @@ def membership_inference_attack(train_df, holdout_df, synth_df, feat_cols, n_eva
 
 
 def lr_membership_inference_attack(train_df, holdout_df, synth_df, feat_cols,
-                                    n_eval=2000, n_shadow=5, fpr_thresholds=(0.01, 0.05, 0.10)):
-    """LR-MIA with unbiased shadow labels (derived from synth_df's own structure)."""
+                                   n_eval=2000, n_shadow=5, fpr_thresholds=(0.01, 0.05, 0.10),
+                                   seed=42):
+    """Classifier-confidence attack (LR-MIA). Shadow labels come only from synth_df
+    (its label column if present, else a PCA median split), never from membership."""
+    rng = np.random.RandomState(seed)
     n_eval = max(50, min(n_eval, len(train_df), len(holdout_df)))
-    mem_idx = np.random.choice(len(train_df), n_eval, replace=False)
-    non_idx = np.random.choice(len(holdout_df), n_eval, replace=False)
+    mem_idx = rng.choice(len(train_df), n_eval, replace=False)
+    non_idx = rng.choice(len(holdout_df), n_eval, replace=False)
     mem_df = train_df.iloc[mem_idx].reset_index(drop=True)
     non_df = holdout_df.iloc[non_idx].reset_index(drop=True)
     all_real = pd.concat([mem_df, non_df], ignore_index=True)
@@ -386,13 +468,12 @@ def lr_membership_inference_attack(train_df, holdout_df, synth_df, feat_cols,
     used = 0
     for sh in range(n_shadow):
         n_sh = min(len(X_synth_sc), 5000)
-        idx = np.random.choice(len(X_synth_sc), n_sh, replace=False)
+        idx = rng.choice(len(X_synth_sc), n_sh, replace=False)
         y_sh = synth_labels[idx]
         if len(np.unique(y_sh)) < 2:
             continue
         try:
-            clf = LogisticRegression(max_iter=300, solver="saga", C=1.0,
-                                     random_state=sh * 7 + 42, n_jobs=-1)
+            clf = LogisticRegression(max_iter=300, solver="saga", C=1.0, random_state=sh * 7 + 42)
             clf.fit(X_synth_sc[idx], y_sh)
             conf_signals[:, used] = clf.predict_proba(X_real_sc).max(axis=1)
             used += 1
@@ -414,8 +495,6 @@ def lr_membership_inference_attack(train_df, holdout_df, synth_df, feat_cols,
     for tr_idx, te_idx in skf.split(atk_feat, y_true):
         X_tr = sc_atk.fit_transform(atk_feat[tr_idx])
         X_te = sc_atk.transform(atk_feat[te_idx])
-        if len(np.unique(y_true[tr_idx])) < 2:
-            continue
         lr = LogisticRegression(max_iter=500, class_weight="balanced", random_state=42)
         lr.fit(X_tr, y_true[tr_idx])
         p = lr.predict_proba(X_te)[:, 1]
@@ -435,26 +514,36 @@ def lr_membership_inference_attack(train_df, holdout_df, synth_df, feat_cols,
 
 
 def privacy_realism_filter(synth_df, ref_df, feat_cols, desired_n=None, k=3,
-                            min_q=0.03, max_q=0.995, max_ref=2000, label="", verbose=True):
-    """Removes near-copies (privacy risk) and out-of-support outliers (realism risk)."""
+                           min_q=0.03, max_q=0.995, max_ref=2000, label="", verbose=True,
+                           return_stats=False):
+    """PrivacyGate. Removes near-copies (closer to the reference data than the 3% quantile
+    of real-to-real kNN distances) and outliers (farther than 1.25x the 99.5% quantile).
+    If fewer than desired_n survive, the shortfall is refilled ONLY from outlier rejects;
+    near-copies are never re-admitted."""
+    stats = {"n_in": int(len(synth_df)), "keep_rate": 1.0, "near_copy_rate": 0.0,
+             "outlier_rate": 0.0, "n_out": int(len(synth_df))}
     if len(synth_df) == 0:
-        return synth_df
+        return (synth_df, stats) if return_stats else synth_df
     use_cols = [c for c in feat_cols if c in ref_df.columns and c in synth_df.columns]
     if not use_cols:
-        return synth_df.head(desired_n) if desired_n else synth_df
+        out = synth_df.head(desired_n) if desired_n else synth_df
+        return (out, stats) if return_stats else out
     ref_s = ref_df.sample(n=min(len(ref_df), max_ref), random_state=42)
     X_ref = _ensure_numeric(ref_s[use_cols], "__none__")[use_cols].values.astype(float)
     X_syn = _ensure_numeric(synth_df[use_cols], "__none__")[use_cols].values.astype(float)
     sc = StandardScaler().fit(X_ref)
     X_ref, X_syn = sc.transform(X_ref), sc.transform(X_syn)
     k_ref = min(k + 1, len(X_ref))
-    d_ref, _ = NearestNeighbors(n_neighbors=k_ref, n_jobs=1).fit(X_ref).kneighbors(X_ref)
+    nn_ref = NearestNeighbors(n_neighbors=k_ref, n_jobs=-1).fit(X_ref)
+    d_ref, _ = nn_ref.kneighbors(X_ref)
     ref_dist = d_ref[:, 1:].mean(1) if d_ref.shape[1] > 1 else d_ref[:, 0]
-    d_syn, _ = NearestNeighbors(n_neighbors=min(k, len(X_ref)), n_jobs=1).fit(X_ref).kneighbors(X_syn)
+    d_syn, _ = NearestNeighbors(n_neighbors=min(k, len(X_ref)), n_jobs=-1).fit(X_ref).kneighbors(X_syn)
     syn_dist = d_syn.mean(1)
     lower = max(float(np.quantile(ref_dist, min_q)), 1e-6)
     upper = max(float(np.quantile(ref_dist, max_q)) * 1.25, lower * 1.5)
-    keep_mask = ~((syn_dist < lower) | (syn_dist > upper))
+    near = syn_dist < lower
+    far = syn_dist > upper
+    keep_mask = ~(near | far)
     df = synth_df.reset_index(drop=True)
     safe = df.loc[keep_mask]
     if desired_n is None:
@@ -462,15 +551,23 @@ def privacy_realism_filter(synth_df, ref_df, feat_cols, desired_n=None, k=3,
     elif len(safe) >= desired_n:
         out = safe.sample(n=desired_n, random_state=42)
     else:
-        out = pd.concat([safe, df.loc[~keep_mask].sample(
-            n=min(desired_n - len(safe), (~keep_mask).sum()), random_state=42)])
+        outliers = df.loc[far]
+        n_fill = min(desired_n - len(safe), len(outliers))
+        out = pd.concat([safe, outliers.sample(n=n_fill, random_state=42)]) if n_fill > 0 else safe
+    n = len(df)
+    stats.update({"keep_rate": float(keep_mask.mean()), "near_copy_rate": float(near.mean()),
+                  "outlier_rate": float(far.mean()), "n_out": int(len(out)),
+                  "lower_bound": lower, "upper_bound": upper, "ref_size": int(len(X_ref))})
     if verbose:
-        print(f"  [PrivacyGate:{label}] keep={keep_mask.sum():,}/{len(df):,}  return={len(out):,}")
-    return out.reset_index(drop=True)
+        print(f"  [PrivacyGate:{label}] keep={keep_mask.sum():,}/{n:,} near-copy={near.sum():,} "
+              f"outlier={far.sum():,} return={len(out):,}")
+    out = out.reset_index(drop=True)
+    return (out, stats) if return_stats else out
 
 
-
-#  SECTION 4 ─ EVALUATION (RF + KNN downstream classifiers)
+#  SECTION 4 ─ EVALUATION (RF + KNN downstream classifiers, threshold 0.5)
+#  The paper's evaluation (validation-selected thresholds etc.) lives in
+#  experiments/evaluation.py; these simple versions are kept for the CLI.
 
 def eval_clf(X_tr, y_tr, X_te, y_te):
     if len(np.unique(y_tr)) < 2:
@@ -485,8 +582,8 @@ def eval_clf(X_tr, y_tr, X_te, y_te):
         "f1": float(f1_score(y_te, pred, zero_division=0)),
         "precision": float(precision_score(y_te, pred, zero_division=0)),
         "recall": float(recall_score(y_te, pred, zero_division=0)),
-        "prob": prob,
     }
+
 
 def eval_clf_knn(X_tr, y_tr, X_te, y_te, n_neighbors=5):
     if len(np.unique(y_tr)) < 2:
@@ -502,6 +599,7 @@ def eval_clf_knn(X_tr, y_tr, X_te, y_te, n_neighbors=5):
         "knn_f1": float(f1_score(y_te, pred, zero_division=0)),
     }
 
+
 def tstr_eval(train_df, sc, X_te, y_te, feat, target):
     X_tr = sc.transform(_ensure_numeric(train_df, target)[feat].values.astype(float))
     y_tr = train_df[target].values.astype(int)
@@ -510,10 +608,12 @@ def tstr_eval(train_df, sc, X_te, y_te, feat, target):
     return out
 
 
-
 #  SECTION 5 ─ QUANTILE MATCHING + POSTPROCESSING
 
 def quantile_match(synth_df, ref_df, feat_cols, blend, orig_df=None):
+    """Stage 6: blend each column with the reference quantile at the same rank.
+    Pass only CONTINUOUS columns in feat_cols, and the TRAINING data as orig_df
+    (bounds) — never the full dataset, which would leak the test range."""
     matched = synth_df.copy()
     n_s = len(synth_df)
     for c in feat_cols:
@@ -556,7 +656,7 @@ def postprocess_synthetic(synth_df, ref_df, target_col, cat_cols, int_cols, hard
     return df
 
 
-#  SECTION 6 ─ MODE NORMALIZER
+#  SECTION 6 ─ MODE NORMALIZER (vectorised)
 
 class ModeNormalizer:
     def __init__(self, n_modes=4):
@@ -578,50 +678,51 @@ class ModeNormalizer:
             self._slices[c] = slice(idx, idx + 1 + nm)
             idx += 1 + nm
         for c in self.cat_cols_:
-            nv = max(int(df[c].nunique()), 1)
+            nv = max(int(df[c].max()) + 1, int(df[c].nunique()), 1)
             self.cat_nvals_[c] = nv
             self._slices[c] = slice(idx, idx + nv)
             idx += nv
         self.out_dim_ = idx
         return self
 
+    @property
+    def cont_scalar_idx(self):
+        return [self._slices[c].start for c in self.cont_cols_]
+
     def transform(self, df):
         n = len(df)
+        rows = np.arange(n)
         out = np.zeros((n, self.out_dim_), dtype=np.float32)
         for c in self.cont_cols_:
             v = df[c].values.reshape(-1, 1).astype(float)
             gm = self.gmms_[c]
             modes = gm.predict(v)
             means = gm.means_.flatten()[modes]
-            stds = np.sqrt(np.array([float(gm.covariances_[m].flatten()[0]) for m in modes]))
+            stds = np.sqrt(gm.covariances_.reshape(len(gm.means_), -1)[:, 0])[modes]
             sl = self._slices[c]
             out[:, sl.start] = np.clip((v.flatten() - means) / (4 * stds + 1e-8), -0.99, 0.99)
-            for i, m in enumerate(modes):
-                out[i, sl.start + 1 + m] = 1.
+            out[rows, sl.start + 1 + modes] = 1.
         for c in self.cat_cols_:
             vals = df[c].values.astype(int)
             nv = self.cat_nvals_[c]
             sl = self._slices[c]
-            for i, val in enumerate(vals):
-                out[i, sl.start + (int(val) % nv)] = 1.
+            out[rows, sl.start + (vals % nv)] = 1.
         return out
 
     def inverse_transform(self, data, orig_df):
-        rows = []
-        for row in data:
-            rec = {}
-            for c in self.cont_cols_:
-                sl, gm = self._slices[c], self.gmms_[c]
-                m = int(np.argmax(row[sl.start + 1:sl.stop]))
-                std = float(np.sqrt(gm.covariances_[m].flatten()[0]))
-                val = float(row[sl.start]) * 4. * std + float(gm.means_.flatten()[m])
-                rec[c] = float(np.clip(val, float(orig_df[c].min()), float(orig_df[c].max())))
-            for c in self.cat_cols_:
-                sl = self._slices[c]
-                rec[c] = int(np.argmax(row[sl])) % self.cat_nvals_[c]
-            rows.append(rec)
-        return pd.DataFrame(rows, columns=self.cont_cols_ + self.cat_cols_)
-
+        data = np.asarray(data)
+        res = {}
+        for c in self.cont_cols_:
+            sl, gm = self._slices[c], self.gmms_[c]
+            m = np.argmax(data[:, sl.start + 1:sl.stop], axis=1)
+            stds = np.sqrt(gm.covariances_.reshape(len(gm.means_), -1)[:, 0])[m]
+            means = gm.means_.flatten()[m]
+            val = data[:, sl.start].astype(float) * 4. * stds + means
+            res[c] = np.clip(val, float(orig_df[c].min()), float(orig_df[c].max()))
+        for c in self.cat_cols_:
+            sl = self._slices[c]
+            res[c] = np.argmax(data[:, sl], axis=1) % self.cat_nvals_[c]
+        return pd.DataFrame(res, columns=self.cont_cols_ + self.cat_cols_)
 
 
 #  SECTION 7 ─ GAN NETWORKS + STABLE NVP FLOW
@@ -666,6 +767,7 @@ class StableAffineCoupling(nn.Module):
         super().__init__()
         self.scale_max = scale_max
         self.d1, self.d2 = dim // 2, dim - dim // 2
+
         def mlp(i, o):
             return nn.Sequential(nn.Linear(i, hidden), nn.Tanh(),
                                  nn.Linear(hidden, hidden), nn.Tanh(), nn.Linear(hidden, o))
@@ -678,6 +780,8 @@ class StableAffineCoupling(nn.Module):
 
 
 class StableNVP(nn.Module):
+    """RealNVP with tanh-bounded log-scales. Dimensions are reversed between
+    coupling layers so that every coordinate is transformed."""
     def __init__(self, dim, n_layers=6, hidden=128, scale_max=2.0):
         super().__init__()
         self.pad = dim % 2
@@ -688,17 +792,20 @@ class StableNVP(nn.Module):
         if self.pad:
             x = torch.cat([x, torch.zeros(x.size(0), self.pad, device=x.device)], 1)
         ld = torch.zeros(x.size(0), device=x.device)
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x, d = layer(x)
-            ld += d
+            ld = ld + d
+            if i < len(self.layers) - 1:
+                x = torch.flip(x, dims=[1])
         return (-0.5 * (x.pow(2).sum(1) + self.dim * math.log(2 * math.pi)) + ld).clamp(-80., 80.)
 
 
 def _train_flow(flow, data_tensor, epochs, lr, device):
     flow = flow.to(device)
     opt = torch.optim.Adam(flow.parameters(), lr=lr, weight_decay=1e-5)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.1)
-    dl = DataLoader(TensorDataset(data_tensor), batch_size=256, shuffle=True, drop_last=True)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(epochs, 1), eta_min=lr * 0.1)
+    bs = min(256, len(data_tensor))
+    dl = DataLoader(TensorDataset(data_tensor), batch_size=bs, shuffle=True, drop_last=True)
     flow.train()
     for _ in range(epochs):
         for (x,) in dl:
@@ -708,83 +815,93 @@ def _train_flow(flow, data_tensor, epochs, lr, device):
             opt.step()
         sched.step()
     flow.eval()
+    for p in flow.parameters():
+        p.requires_grad_(False)
 
 
-#  SECTION 8 ─ DP-CTGAN  (dataset-agnostic engine)
+#  SECTION 8 ─ DP-CTGAN ENGINE
 
 class DPCTGAN:
-    """
-    Differentially-private CTGAN with:
-      - minority-aware moment/feature matching so rare classes aren't dropped
-      - optional (epsilon=None => no-DP) Opacus DP-SGD training
-      - StableNVP normalizing-flow "rare sampler" for oversampling the minority
-        class beyond what plain GAN sampling would give you
-    Dataset-agnostic: works on the ModeNormalizer-encoded representation only.
-    """
+    """Conditional tabular GAN with a DP-SGD discriminator, minority-aware
+    generator objective, and a flow-guided rare-minority sampler."""
 
-    def __init__(self, epsilon=None, delta=1e-5, hp: Hyperparams = None, verbose=True):
+    def __init__(self, epsilon=None, delta=None, hp: Hyperparams = None, verbose=True):
         hp = hp or Hyperparams()
+        self.hp = hp
         self.epsilon = epsilon
         self.use_dp = epsilon is not None
-        self.delta = delta
+        self.delta = delta if delta is not None else hp.delta
         self.epochs = hp.gan_epochs
-        self.flow_epochs = hp.flow_epochs
         self.batch_size = hp.batch_size
         self.latent_dim = hp.latent_dim
         self.hidden_dims = (hp.hidden_dim, hp.hidden_dim)
-        self.gen_lr, self.disc_lr = hp.gen_lr, hp.disc_lr
         self.max_grad_norm = hp.dp_max_grad_norm
-        self.finetune_epochs = hp.finetune_epochs
         self.r1_gamma = hp.r1_gamma if not self.use_dp else 0.0
-        self.minority_batch_frac = hp.minority_batch_frac
         self.verbose = verbose
         self._fitted = False
         self.flow_min = self.flow_maj = None
-        self._h_scaler = self._flow_pca = None
-        self._minority_idx = self._majority_idx = None
         self._minority_rate = 0.0
         self._actual_epsilon = float('inf')
+        self.dp_info = {}
 
+    # -- helpers --------------------------------------------------------
     def _cond(self, n, mode='majority'):
         c = torch.zeros(n, 2, device=DEVICE)
         c[:, 1 if mode == 'minority' else 0] = 1.
         return c
 
-    def _balanced_batch(self, data_tensor, bs):
-        if self._minority_idx is None or len(self._minority_idx) == 0:
-            return data_tensor[np.random.randint(0, len(data_tensor), bs)].to(DEVICE)
-        n_min = max(1, int(bs * self.minority_batch_frac))
-        n_maj = bs - n_min
-        idx = np.concatenate([np.random.choice(self._minority_idx, n_min, replace=True),
-                              np.random.choice(self._majority_idx, n_maj, replace=True)])
-        return data_tensor[idx].to(DEVICE)
+    @staticmethod
+    def _onehot(y):
+        return F.one_hot(y.long(), 2).float()
 
+    def _balanced_batch(self, bs):
+        n_min = max(1, int(bs * self.hp.minority_batch_frac)) if len(self._minority_idx) else 0
+        n_maj = bs - n_min
+        idx = np.concatenate([np.random.choice(self._minority_idx, n_min, replace=True) if n_min else np.array([], int),
+                              np.random.choice(self._majority_idx, n_maj, replace=True)])
+        return self._data_tensor[idx].to(DEVICE), self._label_tensor[idx].to(DEVICE)
+
+    # -- training -------------------------------------------------------
     def fit(self, df, discrete_columns, target_col, ds_name=""):
         t0 = time.time()
+        hp = self.hp
         self._target_col = target_col
-        self._norm = ModeNormalizer().fit(df, discrete_columns)
-        data_np = self._norm.transform(df)
+        feat_df = df.drop(columns=[target_col])
+        self._feat_cols = list(feat_df.columns)
+        self._orig_df = feat_df.copy()
+        self._norm = ModeNormalizer().fit(feat_df, [c for c in discrete_columns if c != target_col])
+        data_np = self._norm.transform(feat_df)
         data_dim = data_np.shape[1]
-        self._orig_df = df.copy()
+        n = len(df)
+        if self.delta is None:
+            self.delta = min(1e-5, 1.0 / (10 * n))
 
         labels = df[target_col].values.astype(int)
         self._minority_idx = np.where(labels == 1)[0]
         self._majority_idx = np.where(labels == 0)[0]
-        self._minority_rate = len(self._minority_idx) / max(len(labels), 1)
+        self._minority_rate = len(self._minority_idx) / max(n, 1)
         min_np = data_np[self._minority_idx] if len(self._minority_idx) else data_np[:1]
         self._min_mean = torch.tensor(min_np.mean(0), dtype=torch.float32, device=DEVICE)
         self._min_std = torch.tensor(min_np.std(0) + 1e-6, dtype=torch.float32, device=DEVICE)
+        self._cont_idx = self._norm.cont_scalar_idx
+        self._real_min_corr = None
+        if len(self._cont_idx) >= 2 and len(self._minority_idx) >= 3:
+            cm = np.nan_to_num(np.corrcoef(min_np[:, self._cont_idx].T), nan=0.0)
+            self._real_min_corr = torch.tensor(cm, dtype=torch.float32, device=DEVICE)
 
         G = Generator(self.latent_dim, 2, data_dim, self.hidden_dims).to(DEVICE)
         D = DiscriminatorNet(data_dim + 2, self.hidden_dims).to(DEVICE)
         if self.use_dp:
             D = ModuleValidator.fix(D)
 
-        opt_G = optim.Adam(G.parameters(), lr=self.gen_lr, betas=(0.5, 0.9))
-        opt_D = optim.Adam(D.parameters(), lr=self.disc_lr, betas=(0.5, 0.9))
+        opt_G = optim.Adam(G.parameters(), lr=hp.gen_lr, betas=(0.5, 0.9))
+        opt_D = optim.Adam(D.parameters(), lr=hp.disc_lr, betas=(0.5, 0.9))
         bce = nn.BCEWithLogitsLoss()
-        data_tensor = torch.tensor(data_np, dtype=torch.float32)
-        loader = DataLoader(TensorDataset(data_tensor), batch_size=self.batch_size, shuffle=True, drop_last=True)
+        self._data_tensor = torch.tensor(data_np, dtype=torch.float32)
+        self._label_tensor = torch.tensor(labels, dtype=torch.long)
+        bs_loader = min(self.batch_size, max(2, n // 2))
+        loader = DataLoader(TensorDataset(self._data_tensor, self._label_tensor),
+                            batch_size=bs_loader, shuffle=True, drop_last=True)
 
         pe = None
         if self.use_dp:
@@ -795,246 +912,310 @@ class DPCTGAN:
                 epochs=self.epochs, max_grad_norm=self.max_grad_norm)
             D.grad_accumulation_allowed = True
             raw_D = D._module
+            self.dp_info = {"noise_multiplier": float(opt_D.noise_multiplier),
+                            "sample_rate": float(getattr(loader, "sample_rate", bs_loader / n)),
+                            "steps_planned": int(self.epochs * len(loader)),
+                            "max_grad_norm": float(self.max_grad_norm), "delta": float(self.delta)}
         else:
             raw_D = D
 
         self._G, self._D = G, D
-        dp_tag = f"ε={self.epsilon}" if self.use_dp else "No-DP"
+        dp_tag = f"eps={self.epsilon}" if self.use_dp else "No-DP"
         if self.verbose:
-            print(f"  ┌─ DPCTGAN [{dp_tag}] [{ds_name}] epochs={self.epochs} "
-                  f"batch={self.batch_size} minority_rate={self._minority_rate:.4f}")
+            extra = f" sigma={self.dp_info['noise_multiplier']:.3f}" if self.use_dp else ""
+            print(f"  DPCTGAN [{dp_tag}] [{ds_name}] epochs={self.epochs} batch={bs_loader} "
+                  f"minority_rate={self._minority_rate:.4f} delta={self.delta:.2e}{extra}")
 
+        warmup_epoch = int(self.epochs * hp.corr_warmup_frac)
         log_every = max(1, self.epochs // 5)
+        steps_done = 0
         for epoch in range(1, self.epochs + 1):
             G.train(); D.train()
-            for (real_batch,) in loader:
-                real_batch = real_batch.to(DEVICE)
-                bs_d = real_batch.size(0)
+            for xb, yb in loader:
+                bs_d = xb.size(0)
                 if bs_d < 2:
                     continue
-                cond_d = self._cond(bs_d, 'majority')
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                cond_d = self._onehot(yb)
                 with torch.no_grad():
                     fake_d = G(torch.randn(bs_d, self.latent_dim, device=DEVICE), cond_d)
                 if self.use_dp or self.r1_gamma <= 0:
-                    both = D(torch.cat([torch.cat([real_batch, cond_d], 1),
-                                        torch.cat([fake_d, cond_d], 1)], 0))
+                    both = D(torch.cat([torch.cat([xb, cond_d], 1), torch.cat([fake_d, cond_d], 1)], 0))
                     loss_D = (bce(both[:bs_d], torch.full((bs_d, 1), 0.9, device=DEVICE))
                               + bce(both[bs_d:], torch.zeros(bs_d, 1, device=DEVICE))) * 0.5
                 else:
-                    real_gp = real_batch.clone().detach().requires_grad_(True)
-                    d_real = D(torch.cat([real_gp, cond_d.detach()], 1))
+                    real_gp = xb.clone().detach().requires_grad_(True)
+                    d_real = D(torch.cat([real_gp, cond_d], 1))
                     grad = torch.autograd.grad(d_real.sum(), real_gp, create_graph=True, retain_graph=True)[0]
                     r1 = (self.r1_gamma / 2.0) * grad.pow(2).sum(1).mean()
                     d_fake = D(torch.cat([fake_d, cond_d], 1))
                     loss_D = (bce(d_real, torch.full((bs_d, 1), 0.9, device=DEVICE))
                               + bce(d_fake, torch.zeros(bs_d, 1, device=DEVICE))) * 0.5 + r1
                 opt_D.zero_grad(); loss_D.backward(); opt_D.step()
+                steps_done += 1
 
+                # ---- generator step (reads real data outside the DP accountant) ----
                 bs = self.batch_size
-                rb = self._balanced_batch(data_tensor, bs)
-                cond_g = self._cond(bs, 'majority')
+                rb, rb_y = self._balanced_batch(bs)
+                cond_g = self._onehot(rb_y)
                 fake_g = G(torch.randn(bs, self.latent_dim, device=DEVICE), cond_g)
                 f_in = torch.cat([fake_g, cond_g], 1)
                 adv = bce(raw_D(f_in), torch.ones(bs, 1, device=DEVICE))
+                feat_fake = raw_D.get_features(f_in)
                 with torch.no_grad():
-                    rf_m = raw_D.get_features(torch.cat([rb, cond_g], 1)).mean(0)
-                fm = F.mse_loss(raw_D.get_features(f_in).mean(0), rf_m.detach())
+                    feat_real = raw_D.get_features(torch.cat([rb, cond_g], 1))
+                fm = F.mse_loss(feat_fake.mean(0), feat_real.mean(0))
+                mmask = rb_y == 1
+                mfm = (F.l1_loss(feat_fake[mmask].mean(0), feat_real[mmask].mean(0))
+                       if int(mmask.sum()) > 1 else torch.zeros((), device=DEVICE))
 
                 mm_bs = min(256, bs)
-                z_min = torch.randn(mm_bs, self.latent_dim, device=DEVICE)
-                fake_min = G(z_min, self._cond(mm_bs, 'minority'))
-                mm_loss = (F.l1_loss(fake_min.mean(0), self._min_mean.detach())
-                           + F.l1_loss(fake_min.std(0), self._min_std.detach()))
+                fake_min = G(torch.randn(mm_bs, self.latent_dim, device=DEVICE), self._cond(mm_bs, 'minority'))
+                mm_loss = (F.l1_loss(fake_min.mean(0), self._min_mean) + F.l1_loss(fake_min.std(0), self._min_std))
+                corr_loss = torch.zeros((), device=DEVICE)
+                if self._real_min_corr is not None and epoch > warmup_epoch and hp.lambda_corr > 0:
+                    corr_loss = F.mse_loss(_torch_corr(fake_min[:, self._cont_idx]), self._real_min_corr)
 
-                loss_G = adv + 1.0 * fm + 2.0 * mm_loss
+                loss_G = (adv + hp.lambda_fm * fm + hp.lambda_mm * mm_loss
+                          + hp.lambda_corr * corr_loss + hp.lambda_mfm * mfm)
                 opt_G.zero_grad(); loss_G.backward(); opt_G.step()
 
             if self.verbose and epoch % log_every == 0:
-                eps_now = pe.get_epsilon(self.delta) if self.use_dp else float('inf')
-                eps_s = f"  ε={eps_now:.3f}" if self.use_dp else ""
+                eps_s = f"  eps={pe.get_epsilon(self.delta):.3f}" if self.use_dp else ""
                 print(f"  ep {epoch:3d}/{self.epochs}{eps_s}")
 
         self._actual_epsilon = pe.get_epsilon(self.delta) if self.use_dp else float('inf')
+        if self.use_dp:
+            self.dp_info.update({"steps_done": int(steps_done), "achieved_epsilon": float(self._actual_epsilon)})
 
-        if self.finetune_epochs > 0:
+        # ---- minority fine-tuning of G with early stopping (D frozen) ----
+        if hp.finetune_epochs > 0:
             G.train()
-            opt_ft = optim.Adam(G.parameters(), lr=max(self.gen_lr * 0.1, 1e-6))
-            for _ in range(self.finetune_epochs):
-                z_min = torch.randn(256, self.latent_dim, device=DEVICE)
-                fake_min = G(z_min, self._cond(256, 'minority'))
-                ft_loss = (F.l1_loss(fake_min.mean(0), self._min_mean.detach())
-                           + 0.5 * F.l1_loss(fake_min.std(0), self._min_std.detach()))
-                opt_ft.zero_grad(); ft_loss.backward(); opt_ft.step()
-            G.eval()
+            opt_ft = optim.Adam(G.parameters(), lr=max(hp.gen_lr * 0.1, 1e-6))
+            best, bad, best_state = float("inf"), 0, copy.deepcopy(G.state_dict())
+            for _ in range(hp.finetune_epochs):
+                ep_loss = []
+                for _ in range(hp.finetune_steps_per_epoch):
+                    fake_min = G(torch.randn(256, self.latent_dim, device=DEVICE), self._cond(256, 'minority'))
+                    ft_loss = (F.l1_loss(fake_min.mean(0), self._min_mean)
+                               + 0.5 * F.l1_loss(fake_min.std(0), self._min_std))
+                    opt_ft.zero_grad(); ft_loss.backward(); opt_ft.step()
+                    ep_loss.append(float(ft_loss.item()))
+                m = float(np.mean(ep_loss))
+                if m < best - 1e-5:
+                    best, bad, best_state = m, 0, copy.deepcopy(G.state_dict())
+                else:
+                    bad += 1
+                    if bad >= hp.finetune_patience:
+                        break
+            G.load_state_dict(best_state)
+        G.eval()
+        for p in G.parameters():
+            p.requires_grad_(False)
 
         self._fitted = True
+        self.train_seconds = time.time() - t0
         if self.verbose:
-            print(f"  Training done  {time.time()-t0:.1f}s  "
-                  f"ε={'∞' if not self.use_dp else f'{self._actual_epsilon:.3f}'}")
+            print(f"  Training done  {self.train_seconds:.1f}s  "
+                  f"eps={'inf' if not self.use_dp else f'{self._actual_epsilon:.3f}'}")
         return self
 
-    def _sample_raw(self, n, mode, batch=256):
-        self._G.eval()
+    # -- sampling -------------------------------------------------------
+    def _decode(self, raw):
+        synth = self._norm.inverse_transform(raw, self._orig_df)
+        return synth[self._feat_cols].reset_index(drop=True)
+
+    def _sample_raw(self, n, mode, batch=2048):
         rows = []
         with torch.no_grad():
             for s in range(0, n, batch):
                 nb = min(batch, n - s)
                 z = torch.randn(nb, self.latent_dim, device=DEVICE)
                 rows.append(self._G(z, self._cond(nb, mode)).cpu().numpy())
-        raw = np.vstack(rows)
-        synth = self._norm.inverse_transform(raw, self._orig_df)
-        for col in self._orig_df.columns:
-            if col not in synth.columns:
-                synth[col] = self._orig_df[col].mode()[0]
-        return synth[self._orig_df.columns].reset_index(drop=True), raw
+        raw = np.vstack(rows) if rows else np.zeros((0, self._norm.out_dim_), dtype=np.float32)
+        return self._decode(raw), raw
 
     def sample_common(self, n):
-        rate = self._minority_rate
-        n_min, n_maj = max(1, int(round(n * rate))), n - max(1, int(round(n * rate)))
-        df_maj, _ = self._sample_raw(n_maj, 'majority')
+        """Conditional sampling at the empirical class ratio."""
+        n_min = max(1, int(round(n * self._minority_rate)))
+        df_maj, _ = self._sample_raw(n - n_min, 'majority')
         df_min, _ = self._sample_raw(n_min, 'minority')
         df_maj[self._target_col] = 0
         df_min[self._target_col] = 1
         return pd.concat([df_maj, df_min], ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
 
-    def build_flows(self, n_samp=8000, hp: Hyperparams = None):
-        """Trains a pair of normalizing flows over the GAN's hidden representation,
-        used by sample_rare() to score/oversample minority-class latent regions."""
-        assert self._fitted
-        hp = hp or Hyperparams()
-        self._G.eval()
-        def sample_h(n, mode):
-            hs = []
-            with torch.no_grad():
-                for s in range(0, n, 256):
-                    nb = min(256, n - s)
-                    z = torch.randn(nb, self.latent_dim, device=DEVICE)
-                    hs.append(self._G.shared(torch.cat([z, self._cond(nb, mode)], 1)).cpu())
-            return torch.cat(hs).numpy()
+    def sample_minority_plain(self, n):
+        """Ablation: n minority samples drawn directly from G(z, c_min)."""
+        df_min, _ = self._sample_raw(n, 'minority')
+        df_min[self._target_col] = 1
+        return df_min
 
-        h_min_np, h_maj_np = sample_h(n_samp, 'minority'), sample_h(n_samp, 'majority')
-        h_all = np.concatenate([h_min_np, h_maj_np])
+    def _hidden(self, z, mode='minority', batch=4096):
+        hs = []
+        with torch.no_grad():
+            for s in range(0, len(z), batch):
+                zb = z[s:s + batch].to(DEVICE)
+                hs.append(self._G.shared(torch.cat([zb, self._cond(len(zb), mode)], 1)))
+        return torch.cat(hs)
+
+    def build_flows(self, hp: Hyperparams = None):
+        """Stage 2 setup: PCA(32, whitened) + standardisation of hidden states, then
+        one flow on minority-conditioned and one on majority-conditioned states."""
+        assert self._fitted
+        hp = hp or self.hp
+        n_samp = hp.flow_n_samples
+        h_min = self._hidden(torch.randn(n_samp, self.latent_dim), 'minority').cpu().numpy()
+        h_maj = self._hidden(torch.randn(n_samp, self.latent_dim), 'majority').cpu().numpy()
+        h_all = np.concatenate([h_min, h_maj])
         pca_k = min(32, h_all.shape[1], len(h_all) - 1)
         self._flow_pca = PCA(n_components=pca_k, whiten=True, random_state=42).fit(h_all)
-        h_min_pca = self._flow_pca.transform(h_min_np).astype(np.float32)
-        h_maj_pca = self._flow_pca.transform(h_maj_np).astype(np.float32)
-        self._h_scaler = StandardScaler().fit(np.concatenate([h_min_pca, h_maj_pca]))
-        h_min_t = torch.tensor(self._h_scaler.transform(h_min_pca), dtype=torch.float32)
-        h_maj_t = torch.tensor(self._h_scaler.transform(h_maj_pca), dtype=torch.float32)
+        p_min, p_maj = self._flow_pca.transform(h_min), self._flow_pca.transform(h_maj)
+        self._h_scaler = StandardScaler().fit(np.concatenate([p_min, p_maj]))
+        # torch copies of the transform so that Stage 3 can back-propagate through it
+        f32 = lambda a: torch.tensor(np.asarray(a), dtype=torch.float32, device=DEVICE)
+        self._pca_mean_t, self._pca_comp_t = f32(self._flow_pca.mean_), f32(self._flow_pca.components_)
+        self._pca_sd_t = f32(np.sqrt(self._flow_pca.explained_variance_))
+        self._sc_mean_t, self._sc_scale_t = f32(self._h_scaler.mean_), f32(self._h_scaler.scale_)
 
-        self.flow_min = StableNVP(pca_k, n_layers=6, hidden=128)
-        self.flow_maj = StableNVP(pca_k, n_layers=6, hidden=128)
-        _train_flow(self.flow_min, h_min_t, hp.flow_epochs, 2e-4, DEVICE)
-        _train_flow(self.flow_maj, h_maj_t, hp.flow_epochs, 2e-4, DEVICE)
+        self.flow_min = StableNVP(pca_k, n_layers=hp.flow_layers, hidden=hp.flow_hidden)
+        self.flow_maj = StableNVP(pca_k, n_layers=hp.flow_layers, hidden=hp.flow_hidden)
+        _train_flow(self.flow_min, f32(self._h_scaler.transform(p_min)).cpu(), hp.flow_epochs, hp.flow_lr, DEVICE)
+        _train_flow(self.flow_maj, f32(self._h_scaler.transform(p_maj)).cpu(), hp.flow_epochs, hp.flow_lr, DEVICE)
         _cuda_clear()
 
-    def _scale_h(self, h_np):
-        return self._h_scaler.transform(self._flow_pca.transform(h_np)).astype(np.float32)
+    def _scale_h_t(self, h):
+        z = (h - self._pca_mean_t) @ self._pca_comp_t.T / self._pca_sd_t
+        return (z - self._sc_mean_t) / self._sc_scale_t
 
-    def sample_rare(self, n, df_real=None, pool_mult=3, max_iters=8):
-        """Oversamples the minority class by ranking candidates with the flow
-        likelihood-ratio (minority flow vs majority flow) and an optional RF
-        probability score, then greedily selecting a diverse top-scoring subset."""
-        assert self.flow_min is not None, "call build_flows() first"
-        self._G.eval()
-        clf = None
-        if df_real is not None:
-            feat_cols = [c for c in df_real.columns if c != self._target_col]
-            try:
-                X_r = _ensure_numeric(df_real, self._target_col)[feat_cols].values.astype(float)
-                y_r = df_real[self._target_col].values.astype(int)
-                if len(np.unique(y_r)) >= 2:
-                    clf = RandomForestClassifier(150, random_state=42, n_jobs=-1, class_weight="balanced")
-                    clf.fit(X_r, y_r)
-            except Exception:
-                pass
+    def _flow_score_t(self, h):
+        s = self._scale_h_t(h)
+        return self.flow_min.log_prob(s) - self.flow_maj.log_prob(s)
 
-        pool_sz = max(n * pool_mult, 2000)
+    def _flow_score(self, h, batch=8192):
+        out = []
+        with torch.no_grad():
+            for s in range(0, len(h), batch):
+                out.append(self._flow_score_t(h[s:s + batch]).cpu())
+        return torch.cat(out).numpy()
+
+    def _refine(self, z, steps, lr, batch=4096):
+        """Stage 3: maximise the flow likelihood ratio w.r.t. z with G frozen."""
+        out = []
+        cmin = None
+        for s in range(0, len(z), batch):
+            zb = z[s:s + batch].clone().to(DEVICE).requires_grad_(True)
+            cmin = self._cond(len(zb), 'minority')
+            opt = torch.optim.Adam([zb], lr=lr)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(steps, 1), eta_min=lr * 0.05)
+            for _ in range(steps):
+                loss = -self._flow_score_t(self._G.shared(torch.cat([zb, cmin], 1))).mean()
+                opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+                with torch.no_grad():
+                    zb.clamp_(-3.5, 3.5)
+            out.append(zb.detach().cpu())
+        return torch.cat(out)
+
+    def sample_rare(self, n, df_real=None, hp: Hyperparams = None, use_flow=True, use_refine=True,
+                    use_judge=True, use_maxmin=True, return_diagnostics=False):
+        """Stages 1-5 of the rare-minority sampler (Stage 6, quantile matching, is applied
+        by the caller). The use_* flags switch stages off for the ablation study."""
+        hp = hp or self.hp
+        assert (self.flow_min is not None) or not use_flow, "call build_flows() first"
+        rng = np.random.RandomState(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        clf, feat_cols = None, self._feat_cols
+        if use_judge and df_real is not None:
+            X_r = _ensure_numeric(df_real, self._target_col)[feat_cols].values.astype(float)
+            y_r = df_real[self._target_col].values.astype(int)
+            if len(np.unique(y_r)) >= 2:
+                clf = RandomForestClassifier(150, random_state=42, n_jobs=-1, class_weight="balanced")
+                clf.fit(X_r, y_r)
+
+        pool_sz = max(hp.rare_pool_size, 2 * n)
         all_raw, all_h, all_score = [], [], []
-        for _ in range(max_iters):
-            if sum(len(r) for r in all_raw) >= n * 2:
+        diag = {"pool_score": [], "refined_before": [], "refined_after": [], "judge_prob": []}
+        for _ in range(hp.rare_max_iters):
+            if sum(len(r) for r in all_raw) >= 2 * n:
                 break
-            zs, cs, hs = [], [], []
+            # Stage 1 — candidate pool
+            z = torch.randn(pool_sz, self.latent_dim)
+            h = self._hidden(z, 'minority')
+            # Stage 2 — flow likelihood-ratio score
+            score = self._flow_score(h) if use_flow else rng.rand(pool_sz)
+            if use_flow and len(diag["pool_score"]) < 50000:
+                diag["pool_score"].append(score[:20000])
+            # Stage 3 — latent refinement of the top-scoring fraction
+            if use_flow and use_refine and hp.refine_steps > 0 and hp.refine_top_frac > 0:
+                k_ref = max(1, int(hp.refine_top_frac * pool_sz))
+                idx_ref = np.argsort(-score)[:k_ref]
+                z[idx_ref] = self._refine(z[idx_ref], hp.refine_steps, hp.refine_lr)
+                h_ref = self._hidden(z[idx_ref], 'minority')
+                new_s = self._flow_score(h_ref)
+                diag["refined_before"].append(score[idx_ref][:20000].copy())
+                diag["refined_after"].append(new_s[:20000])
+                h[torch.as_tensor(idx_ref, device=h.device)] = h_ref
+                score[idx_ref] = new_s
+            # keep the better half by score (or a random half without flows)
+            k_keep = min(pool_sz, max(2 * n, pool_sz // 2))
+            top_idx = np.argsort(-score)[:k_keep]
             with torch.no_grad():
-                for s in range(0, pool_sz, 256):
-                    nb = min(256, pool_sz - s)
-                    z = torch.randn(nb, self.latent_dim, device=DEVICE)
-                    c = self._cond(nb, 'minority')
-                    zs.append(z.cpu()); cs.append(c.cpu())
-                    hs.append(self._G.shared(torch.cat([z, c], 1)).cpu())
-            z_all, c_all, h_all = torch.cat(zs), torch.cat(cs), torch.cat(hs)
-            h_sc = torch.tensor(self._scale_h(h_all.numpy()), dtype=torch.float32)
-            with torch.no_grad():
-                lr_score = (self.flow_min.log_prob(h_sc.to(DEVICE))
-                            - self.flow_maj.log_prob(h_sc.to(DEVICE))).cpu().numpy()
-            lr_rank = _rank_norm(lr_score)
-            k_keep = min(len(z_all), max(n * 2, pool_sz // 2))
-            top_idx = np.argsort(lr_rank)[::-1][:k_keep]
-            raw_out = []
-            with torch.no_grad():
-                for s in range(0, len(top_idx), 256):
-                    idx = top_idx[s:s+256]
-                    raw_out.append(self._G(z_all[idx].to(DEVICE), c_all[idx].to(DEVICE)).cpu().numpy())
-            raw_out = np.concatenate(raw_out)
-            df_pool = self._norm.inverse_transform(raw_out, self._orig_df)
-            for col in self._orig_df.columns:
-                if col not in df_pool.columns:
-                    df_pool[col] = self._orig_df[col].mode()[0]
-            df_pool = df_pool[self._orig_df.columns].reset_index(drop=True)
-            mask = np.ones(len(df_pool), dtype=bool)
+                raw = self._G.out(h[torch.as_tensor(top_idx, device=h.device)]).cpu().numpy()
+            h_sc = self._scale_h_t(h[torch.as_tensor(top_idx, device=h.device)]).cpu().numpy() if use_flow \
+                else h[torch.as_tensor(top_idx, device=h.device)].cpu().numpy()
+            # Stage 4 — RF judge
+            mask = np.ones(len(raw), dtype=bool)
             if clf is not None:
-                try:
-                    X_p = _ensure_numeric(df_pool, self._target_col)[feat_cols].values.astype(float)
-                    probs = clf.predict_proba(X_p)[:, 1]
-                    mask = probs >= np.percentile(probs, 60)
-                except Exception:
-                    pass
+                probs = clf.predict_proba(self._decode(raw)[feat_cols].values.astype(float))[:, 1]
+                thr = max(float(np.percentile(probs, 100 * (1 - hp.judge_keep_frac))), hp.judge_min_prob)
+                mask = probs >= thr
+                diag["judge_prob"].append(probs[:20000])
             if mask.sum() == 0:
                 continue
-            all_raw.append(raw_out[mask])
-            all_h.append(h_sc.numpy()[top_idx][mask])
-            all_score.append(lr_rank[top_idx][mask])
+            all_raw.append(raw[mask]); all_h.append(h_sc[mask]); all_score.append(score[top_idx][mask])
 
         if not all_raw:
-            df_fb, _ = self._sample_raw(n, 'minority')
-            df_fb[self._target_col] = 1
-            return df_fb.head(n).reset_index(drop=True)
+            df_fb = self.sample_minority_plain(n)
+            return (df_fb, {}) if return_diagnostics else df_fb
 
-        mega_raw, mega_h, mega_score = np.concatenate(all_raw), np.concatenate(all_h), np.concatenate(all_score)
-        df_all = self._norm.inverse_transform(mega_raw, self._orig_df)
-        for col in self._orig_df.columns:
-            if col not in df_all.columns:
-                df_all[col] = self._orig_df[col].mode()[0]
-        df_all = df_all[self._orig_df.columns].reset_index(drop=True)
-        k_sel = min(n, len(df_all))
-        sel_idx = greedy_maxmin_pca(mega_h, k=k_sel, scores=mega_score)
-        df_sel = df_all.iloc[sel_idx].copy().reset_index(drop=True)
+        raw_all, h_all, s_all = np.concatenate(all_raw), np.concatenate(all_h), np.concatenate(all_score)
+        k_sel = min(n, len(raw_all))
+        # Stage 5 — diversity selection
+        if use_maxmin:
+            sel = greedy_maxmin_pca(h_all, k=k_sel, scores=s_all)
+        elif use_flow:
+            sel = np.argsort(-s_all)[:k_sel]
+        else:
+            sel = rng.choice(len(raw_all), k_sel, replace=False)
+        df_sel = self._decode(raw_all[sel])
         df_sel[self._target_col] = 1
-        return df_sel
+        diag["selected_score"] = [s_all[sel]]
+        diag = {k: (np.concatenate(v) if v else np.array([])) for k, v in diag.items()}
+        return (df_sel, diag) if return_diagnostics else df_sel
 
 
-#  SECTION 9 ─ OPTUNA HYPERPARAMETER TUNING (optional, 2-stage: GAN + DP)
+#  SECTION 9 ─ OPTUNA HYPERPARAMETER TUNING
 
 def target_cat_cols(df, feat_cols, target, max_card=20):
     return [c for c in feat_cols if c != target and df[c].nunique() <= max_card]
 
 
 def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_val,
-                target, feat_cols, cat_cols, base_hp: Hyperparams, n_trials=8):
-    """Tunes gan_epochs / lr / batch_size / (max_grad_norm if DP) against a
-    TSTR-AUC objective penalized for distribution mismatch and MIA leakage."""
+                target, feat_cols, cat_cols, base_hp: Hyperparams, n_trials=8, seed=42):
+    """Tunes gan_epochs / learning rates / batch size / (max_grad_norm if DP) against
+    validation TSTR AUC penalised by KS/JS distance and excess kNN-MIA AUC."""
     if optuna is None:
         print("  [Optuna] not installed — skipping tuning, using default hyperparams.")
         return base_hp
 
     def objective(trial):
         hp = Hyperparams(**asdict(base_hp))
-        hp.gan_epochs = trial.suggest_int("gan_epochs", 20, 60, step=10)
+        hp.gan_epochs = trial.suggest_int("gan_epochs", 20, max(30, base_hp.gan_epochs), step=10)
         hp.gen_lr = trial.suggest_float("gen_lr", 5e-5, 5e-4, log=True)
         hp.disc_lr = trial.suggest_float("disc_lr", 5e-5, 5e-4, log=True)
         hp.batch_size = trial.suggest_categorical("batch_size", [256, 512])
         if epsilon is not None:
-            hp.dp_max_grad_norm = trial.suggest_float("max_grad_norm", 1.0, 10.0)
+            hp.dp_max_grad_norm = trial.suggest_float("dp_max_grad_norm", 1.0, 10.0)
+        else:
+            hp.r1_gamma = trial.suggest_float("r1_gamma", 5.0, 15.0)
         try:
             model = DPCTGAN(epsilon=epsilon, hp=hp, verbose=False)
             model.fit(gan_train_df, cat_cols, target, ds_name="optuna_trial")
@@ -1057,7 +1238,7 @@ def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_
             _cuda_clear()
             return -1.0
 
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best = study.best_params
     print(f"  [Optuna] best score={study.best_value:.4f}  params={best}")
@@ -1067,17 +1248,16 @@ def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_
     return out_hp
 
 
-#  SECTION 10 ─ END-TO-END PIPELINE
+#  SECTION 10 ─ SINGLE-RUN PIPELINE (quick use; the paper grid is experiments/run_experiments.py)
 
 def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams = None,
                  tune: bool = False, n_optuna_trials: int = 8, out_dir: str = "output"):
-    """Runs load -> train -> sample -> evaluate for one epsilon setting.
-    Returns (metrics_dict, synthetic_df)."""
     hp = hp or Hyperparams()
     os.makedirs(out_dir, exist_ok=True)
 
     df, target, cat_cols = load_dataset(cfg)
     feat = [c for c in df.columns if c != target]
+    cont_cols = [c for c in feat if c not in cat_cols]
     y_all = df[target].values.astype(int)
 
     i_aug, i_te = train_test_split(np.arange(len(df)), test_size=hp.test_split,
@@ -1085,7 +1265,6 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     aug_df_full = df.iloc[i_aug].reset_index(drop=True)
     test_df = df.iloc[i_te].reset_index(drop=True)
     y_te = y_all[i_te]
-
     i_gan, i_mia = train_test_split(np.arange(len(aug_df_full)), test_size=hp.final_mia_holdout_frac,
                                     random_state=42, stratify=aug_df_full[target].values)
     aug_df = aug_df_full.iloc[i_gan].reset_index(drop=True)
@@ -1113,27 +1292,27 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
 
     print(f"\n  Training DP-CTGAN  (epsilon={'No-DP' if epsilon is None else epsilon})...")
     model = DPCTGAN(epsilon=epsilon, hp=hp, verbose=True)
-    model.fit(aug_df, target_cat_cols(aug_df, feat, target) if cat_cols is None else cat_cols,
-              target, ds_name=cfg.name)
+    model.fit(aug_df, cat_cols, target, ds_name=cfg.name)
 
     n_aug = len(aug_df)
     common_df = model.sample_common(n_aug)
     common_df = postprocess_synthetic(common_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
     if hp.privacy_filter_enabled:
-        common_df = privacy_realism_filter(common_df, aug_df, feat, desired_n=n_aug, label="common")
+        common_df = privacy_realism_filter(common_df, aug_df, feat, desired_n=n_aug, label="common",
+                                           max_ref=hp.privacy_max_ref)
 
     rare_df = pd.DataFrame()
     try:
-        model.build_flows(hp=hp)
+        model.build_flows(hp)
         n_real_min = int(aug_df[target].sum())
         n_rare_need = max(200, int(n_real_min * hp.rare_multiplier))
-        rare_df = model.sample_rare(n_rare_need, df_real=aug_df)
-        rare_df = quantile_match(rare_df.drop(columns=[target]), real_minority, feat,
-                                 blend=hp.quantile_blend, orig_df=df)
+        rare_df = model.sample_rare(n_rare_need, df_real=aug_df, hp=hp)
+        rare_df = quantile_match(rare_df, real_minority, cont_cols, blend=hp.quantile_blend, orig_df=aug_df)
         rare_df[target] = 1
         rare_df = postprocess_synthetic(rare_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
         if hp.privacy_filter_enabled:
-            rare_df = privacy_realism_filter(rare_df, real_minority, feat, desired_n=n_rare_need, label="rare")
+            rare_df = privacy_realism_filter(rare_df, real_minority, feat, desired_n=n_rare_need,
+                                             label="rare", max_ref=hp.privacy_max_ref)
     except Exception as e:
         print(f"  [WARN] rare-sampling step failed, continuing with common-only synth: {e}")
 
@@ -1147,7 +1326,7 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     lr_mia = lr_membership_inference_attack(aug_df, final_mia_holdout, combined_df, feat)
 
     metrics = {
-        "epsilon": epsilon, "actual_epsilon": model._actual_epsilon,
+        "epsilon": epsilon, "actual_epsilon": model._actual_epsilon, "dp_info": model.dp_info,
         "rf_auc": tstr["auc"], "rf_auprc": tstr["auprc"], "rf_f1": tstr["f1"],
         "knn_auc": tstr["knn_auc"], "knn_auprc": tstr["knn_auprc"],
         "ks_mean": ks_mean, "js_mean": js_mean,
@@ -1155,54 +1334,51 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
         "lr_mia_auc": lr_mia["lr_mia_auc"], "lr_mia_advantage": lr_mia["lr_mia_advantage"],
         "n_synthetic_rows": len(combined_df),
     }
-
     print("\n  ── RESULTS ──────────────────────────────────────────")
     for k, v in metrics.items():
         print(f"  {k:<20} {v}")
-    print("  ─────────────────────────────────────────────────────")
-
     out_csv = os.path.join(out_dir, f"synthetic_{cfg.name}_eps{epsilon}.csv")
     combined_df.to_csv(out_csv, index=False)
     with open(os.path.join(out_dir, f"metrics_{cfg.name}_eps{epsilon}.json"), "w") as f:
         json.dump(metrics, f, indent=2, default=str)
     print(f"\n  Saved synthetic data -> {out_csv}")
-
     return metrics, combined_df
-
 
 
 #  SECTION 11 ─ CLI
 
 def main():
-    p = argparse.ArgumentParser(description="Generalized DP-CTGAN pipeline — works on any tabular CSV.")
+    p = argparse.ArgumentParser(description="DP-CTGAN single run — works on any tabular CSV.")
     p.add_argument("--data", type=str, default=None, help="Path to a CSV file (overrides --preset).")
-    p.add_argument("--target", type=str, default=None, help="Target column name (required with --data unless auto-detectable).")
-    p.add_argument("--preset", type=str, default=None, choices=list(DATASET_PRESETS.keys()),
-                   help="Use a built-in dataset preset instead of --data.")
-    p.add_argument("--epsilon", type=str, default="none",
-                   help="Privacy budget. Use 'none' for no-DP, or a number like 3 / 10.")
-    p.add_argument("--tune", action="store_true", help="Run Optuna hyperparameter tuning first.")
-    p.add_argument("--trials", type=int, default=8, help="Number of Optuna trials if --tune is set.")
-    p.add_argument("--gan-epochs", type=int, default=None, help="Override GAN training epochs.")
-    p.add_argument("--out", type=str, default="output", help="Output directory.")
+    p.add_argument("--target", type=str, default=None)
+    p.add_argument("--preset", type=str, default=None, choices=list(DATASET_PRESETS.keys()))
+    p.add_argument("--epsilon", type=str, default="none", help="'none' for no-DP, or a number like 3 / 10.")
+    p.add_argument("--delta", type=float, default=None, help="Default: min(1e-5, 1/(10 n_train)).")
+    p.add_argument("--tune", action="store_true")
+    p.add_argument("--trials", type=int, default=8)
+    p.add_argument("--gan-epochs", type=int, default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--out", type=str, default="output")
     args = p.parse_args()
 
+    set_seed(args.seed)
     if args.data:
         cfg = DatasetConfig(name=os.path.splitext(os.path.basename(args.data))[0],
                             path=args.data, target_col=args.target)
+        hp = Hyperparams(**asdict(HYPERPARAMS))
     elif args.preset:
         cfg = DATASET_PRESETS[args.preset]
+        hp = hyperparams_for(args.preset)
     else:
         cfg = DATASET_CONFIG
-        print(f"  No --data or --preset given, using DATASET_CONFIG (preset='{cfg.name}') "
-              f"from the top of this script.")
+        hp = hyperparams_for(cfg.name)
+        print(f"  No --data or --preset given, using preset '{cfg.name}'.")
 
     epsilon = None if args.epsilon.lower() in ("none", "nodp", "no-dp") else float(args.epsilon)
-
-    hp = Hyperparams(**asdict(HYPERPARAMS))
     if args.gan_epochs:
         hp.gan_epochs = args.gan_epochs
-
+    if args.delta is not None:
+        hp.delta = args.delta
     run_pipeline(cfg, epsilon, hp=hp, tune=args.tune, n_optuna_trials=args.trials, out_dir=args.out)
 
 
