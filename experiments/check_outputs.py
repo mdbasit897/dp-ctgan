@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Check that every input and output the manuscript needs is present and complete.
 
-  python3 experiments/check_outputs.py            # from the repository root
+  python3 experiments/check_outputs.py                       # from the repository root
+  python3 experiments/check_outputs.py --baseline-seeds 5    # if the baselines use all 5 seeds
 
 Checks: prepared datasets, tuned hyperparameters, the 80-run grid (completeness, tuned settings
 actually used, achieved epsilon, ablations, PrivacyGate), the seed-0 artifacts the figures need,
 baselines, and the aggregated tables / figures. Prints a short results overview at the end.
 """
+import argparse
 import glob
 import json
 import os
@@ -26,6 +28,10 @@ FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", 
           [f"fig_{k}_{d}" for k in ("marginals", "embedding", "corrdiff") for d in DATASETS]
 BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "pategan": ["1", "3", "10"],
              "dpgan": ["1", "3", "10"], "aim": ["1", "3", "10"]}
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--baseline-seeds", type=int, default=3, help="number of seeds the baselines are run with")
+BL_SEEDS = ap.parse_args().baseline_seeds
 
 problems, warnings = [], []
 
@@ -110,13 +116,15 @@ ok(not miss, f"all {len(DATASETS) * len(EPS) * len(ARTIFACTS)} artifact files pr
 
 section("5. Baselines (results/baselines/)")
 for meth, eps_l in BASELINES.items():
-    want = len(DATASETS) * len(eps_l) * len(SEEDS)
-    have = len(glob.glob(f"results/baselines/{meth}/*/eps*/seed*/metrics.json"))
+    want = len(DATASETS) * len(eps_l) * BL_SEEDS
+    files = [f for s in range(BL_SEEDS) for f in glob.glob(f"results/baselines/{meth}/*/eps*/seed{s}/metrics.json")]
     errs = glob.glob(f"results/baselines/{meth}/*/eps*/seed*/error.txt")
-    ok(have == want and not errs, f"{meth:8s} {have}/{want}",
-       f"{meth:8s} {have}/{want} done, {len(errs)} errors" + (f" (e.g. {errs[0]})" if errs else ""), warn=True)
-ok(os.path.exists(".venv-synthcity/bin/python"), "synthcity environment .venv-synthcity exists",
-   "no .venv-synthcity environment (section 6.3)", warn=True)
+    ok(len(files) == want and not errs, f"{meth:8s} {len(files)}/{want}",
+       f"{meth:8s} {len(files)}/{want} done, {len(errs)} errors" + (f" (e.g. {errs[0]})" if errs else ""), warn=True)
+    if meth in ("ctgan", "tvae", "dpgan"):
+        old_runs = [f for f in files if not json.load(open(f))["meta"].get("n_iter")]
+        ok(not old_runs, f"{meth:8s} all runs use the fixed --n-iter setting",
+           f"{meth:8s} {len(old_runs)} run(s) made with synthcity's default length; delete them: {old_runs[:3]}")
 
 section("6. Aggregated tables (results/summary/) and figures (results/figures/)")
 miss_t = [t for t in TABLES if not os.path.exists(f"results/summary/{t}")]

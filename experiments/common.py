@@ -6,7 +6,11 @@ make_splits() so that all methods see exactly the same records for a seed.
 import os
 import sys
 
-import numpy as np
+import gpu_select  # must run before torch is imported: one GPU per process on multi-GPU machines
+
+gpu_select.assign()
+
+import numpy as np  # noqa: E402
 import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier

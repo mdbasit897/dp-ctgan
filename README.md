@@ -71,10 +71,11 @@ for i in 0 1 2; do
     python3 experiments/run_experiments.py --shard $i/3 --ablations > logs/worker_$i.log 2>&1 &
 done; wait
 
-# 5. Baselines (synthcity in its own environment; SMOTE in the main one)
-python3 experiments/run_baselines.py --methods pategan dpgan aim --eps 1 3 10     # in .venv-synthcity
-python3 experiments/run_baselines.py --methods ctgan tvae --eps none              # in .venv-synthcity
-python3 experiments/run_baselines.py --methods smote --eps none                   # main environment
+# 5. Baselines on the same splits: 3 seeds; CTGAN / TVAE / DP-GAN trained for 300 epochs (--n-iter)
+python3 experiments/run_baselines.py --methods pategan dpgan aim --eps 1 3 10 --seeds 0 1 2
+python3 experiments/run_baselines.py --methods ctgan tvae --eps none --seeds 0 1 2
+python3 experiments/run_baselines.py --methods smote --eps none
+python3 experiments/check_outputs.py          # verifies datasets, tuning, grid, artifacts, baselines, tables
 
 # 6. Tables and figures
 python3 experiments/aggregate.py --results results --ablation-eps 3

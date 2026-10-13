@@ -10,6 +10,10 @@ Writes results/baselines/<method>/<dataset>/eps<e>/seed<s>/metrics.json.
 
   python experiments/run_baselines.py --methods pategan dpgan aim ctgan tvae --eps 1 3 10
   python experiments/run_baselines.py --methods smote --eps none
+
+Training length: CTGAN, TVAE and DP-GAN run for --n-iter epochs (default 300, the CTGAN paper's
+default; synthcity's own default of 2000 takes many hours per run on Credit Card Fraud). The value
+used is stored in metrics.json (meta.n_iter). Pass --n-iter 0 to keep synthcity's defaults.
 """
 import argparse
 import json
@@ -24,12 +28,15 @@ from sklearn.preprocessing import StandardScaler
 from common import DATASETS, P, eps_tag, fidelity, load, make_splits, parse_eps, privacy, tstr
 
 DP_METHODS = {"pategan", "dpgan", "aim", "privbayes", "sn_dpctgan", "sn_patectgan", "sn_mst"}
+ITER_METHODS = {"ctgan", "tvae", "dpgan"}  # synthcity plugins whose training length is set by n_iter
 
 
-def gen_synthcity(name, train, target, eps, delta, n, seed):
+def gen_synthcity(name, train, target, eps, delta, n, seed, n_iter=0):
     from synthcity.plugins import Plugins
     from synthcity.plugins.core.dataloader import GenericDataLoader
     kw = {"random_state": seed}
+    if n_iter and name in ITER_METHODS:
+        kw["n_iter"] = n_iter
     if name in DP_METHODS:
         kw.update({"epsilon": eps, "delta": delta})
     try:
@@ -72,7 +79,7 @@ def run_one(method, ds, eps, seed, args):
     elif method.startswith("sn_"):
         synth = gen_smartnoise(method, tr, target, cat_cols, eps, len(tr))
     else:
-        synth = gen_synthcity(method, tr, target, eps, delta, len(tr), seed)
+        synth = gen_synthcity(method, tr, target, eps, delta, len(tr), seed, args.n_iter)
     secs = time.time() - t
     synth = synth[df.columns].copy()
     synth[target] = (pd.to_numeric(synth[target], errors="coerce").fillna(0) > 0.5).astype(int)
@@ -82,7 +89,8 @@ def run_one(method, ds, eps, seed, args):
 
     scaler = StandardScaler().fit(P._ensure_numeric(tr, target)[feat].values.astype(float))
     R = {"meta": {"method": method, "dataset": ds, "epsilon": eps, "seed": seed, "delta": delta,
-                  "fit_seconds": secs, "n_synth": len(synth), "minority_rate_synth": float(synth[target].mean())},
+                  "fit_seconds": secs, "n_synth": len(synth), "minority_rate_synth": float(synth[target].mean()),
+                  "n_iter": args.n_iter if method in ITER_METHODS and args.n_iter else None},
          "utility": tstr(synth, sp, scaler, feat, target, 5, seed),
          "fidelity": fidelity(tr, synth, feat, target, seed)}
     if method != "smote":  # SMOTE output contains real records; MIA is not meaningful
@@ -99,6 +107,8 @@ def main():
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--out", default="results/baselines")
     ap.add_argument("--delta", type=float, default=None)
+    ap.add_argument("--n-iter", type=int, default=300,
+                    help="training epochs for ctgan / tvae / dpgan (0 = synthcity default)")
     args = ap.parse_args()
     for m in args.methods:
         eps_list = [parse_eps(e) for e in args.eps] if m in DP_METHODS else [None]
