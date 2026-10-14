@@ -151,6 +151,41 @@ class Hyperparams:
     knn_k: int = 5
     test_split: float = 0.20
     final_mia_holdout_frac: float = 0.10
+    # privacy mode (see apply_privacy_mode): "legacy" = first experiment round (real-data
+    # statistics, RF judge and quantile matching outside the accountant); "dp" = every
+    # component that reads real data is covered by the DP budget, except the GMM encoder
+    privacy_mode: str = "legacy"
+    budget_frac_judge: float = 0.10          # share of epsilon for the DP-SGD judge (judge_type="mlp")
+    budget_frac_stats: float = 0.10          # share of epsilon for the minority mean/std (Gaussian mechanism)
+    judge_type: str = "rf"                   # "rf" (non-private), "mlp" (DP-SGD in dp mode), "disc" (DP discriminator)
+    judge_epochs: int = 10
+    judge_batch: int = 256
+    judge_lr: float = 1e-3
+    judge_max_grad_norm: float = 1.0
+    mm_noise_ref: float = 0.1                # moment matching is down-weighted when noise/n exceeds this
+    finetune_min_mm_weight: float = 0.5      # skip minority fine-tuning when the noisy moments are this unreliable
+
+
+def apply_privacy_mode(hp: "Hyperparams", mode: str) -> "Hyperparams":
+    """Configure the components that read real data.
+
+    legacy: the first experiment round, unchanged.
+    dp:     the generator sees real data only through the DP discriminator and through
+            minority mean/std released with the Gaussian mechanism; no feature matching,
+            correlation matching or quantile matching; the judge is a DP-SGD classifier;
+            the PrivacyGate only measures near-copies (filtering would be data-dependent).
+    The same configuration is used without DP (epsilon=None), just without noise, so that
+    the No-DP column is the same model.
+    """
+    hp.privacy_mode = mode
+    if mode == "dp":
+        hp.lambda_fm = hp.lambda_mfm = hp.lambda_corr = 0.0
+        hp.quantile_blend = 0.0
+        hp.privacy_filter_enabled = False
+        hp.judge_type = "mlp"
+    elif mode != "legacy":
+        raise ValueError(f"unknown privacy mode {mode!r}")
+    return hp
 
 
 DATA_DIR = os.environ.get("DPCTGAN_DATA_DIR", "data")
@@ -389,6 +424,100 @@ def _torch_corr(x):
     return cov / (std[:, None] * std[None, :])
 
 
+#  SECTION 2b ─ DIFFERENTIAL-PRIVACY HELPERS (Gaussian mechanism, RDP composition)
+
+# RDP orders for dp mode. Opacus' default orders stop at 63, which puts a floor of about
+# log(1/delta)/62 (~0.22 for delta = 1e-6) on any epsilon it can certify; the budget shares in
+# dp mode (e.g. 10% of epsilon = 1) are below that. Larger orders remove the floor.
+RDP_ALPHAS = ([1 + x / 10.0 for x in range(1, 100)] + list(range(12, 64)) + list(range(64, 257, 4))
+              + [320, 384, 512, 768, 1024])
+
+
+def gaussian_noise_multiplier(epsilon, delta):
+    """Noise multiplier z (noise std = z * L2-sensitivity) of one Gaussian mechanism that is
+    exactly (epsilon, delta)-DP: the analytic Gaussian mechanism (Balle & Wang, ICML 2018, Thm. 8),
+        delta(z) = Phi(1/(2z) - eps*z) - exp(eps) * Phi(-1/(2z) - eps*z),
+    solved for the smallest z with delta(z) <= delta by bisection."""
+    from scipy.stats import norm
+
+    def delta_of(z):
+        return norm.cdf(0.5 / z - epsilon * z) - math.exp(epsilon) * norm.cdf(-0.5 / z - epsilon * z)
+
+    lo, hi = 1e-3, 1.0
+    while delta_of(hi) > delta:
+        hi *= 2.0
+        if hi > 1e7:
+            raise ValueError("Gaussian mechanism: budget too small")
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if delta_of(mid) > delta else (lo, mid)
+    return float(hi)
+
+
+def make_private_dp(pe, module, optimizer, data_loader, epsilon, delta, epochs, max_grad_norm):
+    """DP-SGD with the noise calibrated by Opacus' RDP accountant over RDP_ALPHAS (dp mode).
+    Same sample rate and number of steps as PrivacyEngine.make_private_with_epsilon, but works
+    for small budgets on every Opacus version."""
+    from opacus.accountants.utils import get_noise_multiplier
+    sigma = get_noise_multiplier(target_epsilon=epsilon, target_delta=delta, sample_rate=1.0 / len(data_loader),
+                                 epochs=epochs, accountant="rdp", alphas=RDP_ALPHAS)
+    return pe.make_private(module=module, optimizer=optimizer, data_loader=data_loader,
+                           noise_multiplier=sigma, max_grad_norm=max_grad_norm)
+
+
+def rdp_epsilon(pe_or_history, delta):
+    """Epsilon over RDP_ALPHAS of a PrivacyEngine or of a list of (noise_multiplier, sample_rate,
+    steps) mechanisms (RDP composition)."""
+    from opacus.accountants import RDPAccountant
+    if hasattr(pe_or_history, "accountant"):
+        return float(pe_or_history.accountant.get_epsilon(delta=delta, alphas=RDP_ALPHAS))
+    acc = RDPAccountant()
+    acc.history = [tuple(h) for h in pe_or_history]
+    return float(acc.get_epsilon(delta=delta, alphas=RDP_ALPHAS))
+
+
+rdp_total_epsilon = rdp_epsilon
+
+
+def minority_statistics(min_np, cont_idx, n_cont_cols, n_cat_cols, epsilon=None, delta=None, rng=None):
+    """Per-coordinate mean and std of the encoded minority records.
+
+    epsilon=None: exact statistics (as in the first experiment round).
+    epsilon given: one Gaussian mechanism on the vector of sums
+        [sum_i x_i (all encoded coordinates), sum_i a_i^2 (continuous scalars), c * count].
+    Every encoded record has bounded norm by construction (continuous scalars are clipped to
+    +-0.99 and each column has exactly one active one-hot entry), so the L2 sensitivity under
+    add/remove-one adjacency is data-independent:
+        B^2 = n_cont * (0.99^2 + 1 + 0.99^4) + n_cat,   sensitivity = sqrt(B^2 + c^2), c = B.
+    Means and stds are post-processed from the noisy sums (clipped to their valid ranges).
+    Returns (mean, std, info)."""
+    d = min_np.shape[1]
+    cont_idx = np.asarray(cont_idx, dtype=int)
+    onehot = np.ones(d, dtype=bool)
+    onehot[cont_idx] = False
+    n = len(min_np)
+    if epsilon is None:
+        return min_np.mean(0), min_np.std(0) + 1e-6, {"n_hat": float(n), "rel_noise": 0.0}
+    rng = rng or np.random.default_rng()
+    B = math.sqrt(n_cont_cols * (0.99 ** 2 + 1.0 + 0.99 ** 4) + n_cat_cols)
+    c = B
+    sens = math.sqrt(B ** 2 + c ** 2)
+    z = gaussian_noise_multiplier(epsilon, delta)
+    sd = z * sens
+    s1 = min_np.sum(0) + rng.normal(0, sd, d)
+    s2 = (min_np[:, cont_idx] ** 2).sum(0) + rng.normal(0, sd, len(cont_idx))
+    n_hat = max((c * n + rng.normal(0, sd)) / c, 20.0)
+    mean = s1 / n_hat
+    mean[onehot] = np.clip(mean[onehot], 0.0, 1.0)
+    mean[cont_idx] = np.clip(mean[cont_idx], -0.99, 0.99)
+    std = np.sqrt(np.clip(mean * (1 - mean), 0.0, None)) + 1e-6
+    var_c = np.clip(s2 / n_hat - mean[cont_idx] ** 2, 1e-4, 1.0)
+    std[cont_idx] = np.sqrt(var_c)
+    info = {"epsilon": float(epsilon), "delta": float(delta), "noise_multiplier": z, "sensitivity": sens,
+            "n_hat": float(n_hat), "rel_noise": float(sd / n_hat)}
+    return mean, std, info
+
+
 #  SECTION 3 ─ DISTRIBUTION METRICS + MIA + PRIVACY GATE
 
 def compute_ks_js(real_df, synth_df, feat_cols, n_bins=50):
@@ -515,11 +644,13 @@ def lr_membership_inference_attack(train_df, holdout_df, synth_df, feat_cols,
 
 def privacy_realism_filter(synth_df, ref_df, feat_cols, desired_n=None, k=3,
                            min_q=0.03, max_q=0.995, max_ref=2000, label="", verbose=True,
-                           return_stats=False):
+                           return_stats=False, audit_only=False):
     """PrivacyGate. Removes near-copies (closer to the reference data than the 3% quantile
     of real-to-real kNN distances) and outliers (farther than 1.25x the 99.5% quantile).
     If fewer than desired_n survive, the shortfall is refilled ONLY from outlier rejects;
-    near-copies are never re-admitted."""
+    near-copies are never re-admitted.
+    audit_only=True measures the same rates but returns synth_df unchanged (dp mode: a
+    data-dependent filter would not be covered by the privacy budget)."""
     stats = {"n_in": int(len(synth_df)), "keep_rate": 1.0, "near_copy_rate": 0.0,
              "outlier_rate": 0.0, "n_out": int(len(synth_df))}
     if len(synth_df) == 0:
@@ -546,6 +677,13 @@ def privacy_realism_filter(synth_df, ref_df, feat_cols, desired_n=None, k=3,
     keep_mask = ~(near | far)
     df = synth_df.reset_index(drop=True)
     safe = df.loc[keep_mask]
+    if audit_only:
+        stats.update({"keep_rate": float(keep_mask.mean()), "near_copy_rate": float(near.mean()),
+                      "outlier_rate": float(far.mean()), "n_out": int(len(df)), "audit_only": True,
+                      "lower_bound": lower, "upper_bound": upper, "ref_size": int(len(X_ref))})
+        if verbose:
+            print(f"  [PrivacyGate:{label} audit] near-copy={near.sum():,} outlier={far.sum():,} of {len(df):,}")
+        return (df, stats) if return_stats else df
     if desired_n is None:
         out = safe
     elif len(safe) >= desired_n:
@@ -819,6 +957,106 @@ def _train_flow(flow, data_tensor, epochs, lr, device):
         p.requires_grad_(False)
 
 
+#  SECTION 7b ─ JUDGES FOR STAGE 4
+#  A judge scores decoded minority candidates; Stage 4 keeps the top judge_keep_frac.
+#  score(raw, decoded) takes the generator output (encoded space) and its decoded frame.
+
+class RFJudge:
+    """Random forest on the real training data (first experiment round). NOT private."""
+    kind, private, has_prob = "rf", False, True
+
+    def __init__(self, target_col, feat_cols):
+        self.target_col, self.feat_cols = target_col, feat_cols
+        self.info = {"kind": self.kind, "private": False}
+
+    def fit(self, df_real):
+        X = _ensure_numeric(df_real, self.target_col)[self.feat_cols].values.astype(float)
+        y = df_real[self.target_col].values.astype(int)
+        self.clf = RandomForestClassifier(150, random_state=42, n_jobs=-1, class_weight="balanced").fit(X, y)
+        return self
+
+    def score(self, raw, decoded):
+        return self.clf.predict_proba(decoded[self.feat_cols].values.astype(float))[:, 1]
+
+
+class MLPJudge:
+    """MLP minority classifier on the GMM-encoded records, trained with DP-SGD (Opacus, RDP
+    accountant) when epsilon is given, otherwise with plain SGD (same architecture)."""
+    kind, has_prob = "mlp", True
+
+    def __init__(self, norm, feat_cols, hp: Hyperparams):
+        self.norm, self.feat_cols, self.hp = norm, feat_cols, hp
+        self.private = False
+        self.info = {"kind": self.kind, "private": False}
+
+    def fit(self, df_feat, y, epsilon=None, delta=None, pos_weight=1.0):
+        hp = self.hp
+        X = torch.tensor(self.norm.transform(df_feat[self.feat_cols]), dtype=torch.float32)
+        Y = torch.tensor(np.asarray(y, dtype=np.float32)).unsqueeze(1)
+        net = nn.Sequential(nn.Linear(X.shape[1], 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU(),
+                            nn.Linear(64, 1)).to(DEVICE)
+        opt = optim.Adam(net.parameters(), lr=hp.judge_lr)
+        loader = DataLoader(TensorDataset(X, Y), batch_size=min(hp.judge_batch, len(X)), shuffle=True)
+        loss_f = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([float(pos_weight)], device=DEVICE))
+        pe = None
+        if epsilon is not None:
+            pe = PrivacyEngine(accountant="rdp")
+            net, opt, loader = make_private_dp(pe, net, opt, loader, epsilon, delta, hp.judge_epochs,
+                                               hp.judge_max_grad_norm)
+        net.train()
+        for _ in range(hp.judge_epochs):
+            for xb, yb in loader:
+                if len(xb) == 0:
+                    continue
+                loss = loss_f(net(xb.to(DEVICE)), yb.to(DEVICE))
+                opt.zero_grad(); loss.backward(); opt.step()
+        net.eval()
+        self.net = net
+        self.private = epsilon is not None
+        self.info = {"kind": self.kind, "private": self.private, "pos_weight": float(pos_weight),
+                     "epochs": hp.judge_epochs}
+        if pe is not None:
+            self.history = [tuple(h) for h in pe.accountant.history]
+            self.info.update({"epsilon_target": float(epsilon), "delta": float(delta),
+                              "noise_multiplier": float(opt.noise_multiplier),
+                              "sample_rate": float(getattr(loader, "sample_rate", np.nan)),
+                              "steps": int(sum(h[2] for h in self.history)),
+                              "achieved_epsilon": rdp_epsilon(pe, delta)})
+        return self
+
+    def score(self, raw, decoded):
+        X = torch.tensor(self.norm.transform(decoded[self.feat_cols]), dtype=torch.float32)
+        out = []
+        with torch.no_grad():
+            for s in range(0, len(X), 8192):
+                out.append(torch.sigmoid(self.net(X[s:s + 8192].to(DEVICE))).squeeze(1).cpu())
+        return torch.cat(out).numpy()
+
+
+class DiscJudge:
+    """Scores candidates with the trained (DP) discriminator:
+    D(x, c_min) - D(x, c_maj), i.e. how much more x looks like a real minority record than a
+    real majority record. Post-processing of the DP discriminator: no extra privacy budget."""
+    kind, private, has_prob = "disc", True, False
+
+    def __init__(self, model):
+        self.model = model
+        self.info = {"kind": self.kind, "private": model.use_dp, "extra_epsilon": 0.0}
+        self.private = model.use_dp
+
+    def score(self, raw, decoded):
+        D, m = self.model._raw_D, self.model
+        D.eval()
+        out = []
+        with torch.no_grad():
+            for s in range(0, len(raw), 8192):
+                x = torch.tensor(raw[s:s + 8192], dtype=torch.float32, device=DEVICE)
+                n = len(x)
+                out.append((D(torch.cat([x, m._cond(n, 'minority')], 1))
+                            - D(torch.cat([x, m._cond(n, 'majority')], 1))).squeeze(1).cpu())
+        return torch.cat(out).numpy()
+
+
 #  SECTION 8 ─ DP-CTGAN ENGINE
 
 class DPCTGAN:
@@ -842,7 +1080,11 @@ class DPCTGAN:
         self.flow_min = self.flow_maj = None
         self._minority_rate = 0.0
         self._actual_epsilon = float('inf')
+        self.epsilon_total = float('inf')     # all components (basic composition); = _actual_epsilon in legacy mode
         self.dp_info = {}
+        self.budget = {}
+        self.judge = None
+        self._mm_weight = 1.0
 
     # -- helpers --------------------------------------------------------
     def _cond(self, n, mode='majority'):
@@ -875,17 +1117,42 @@ class DPCTGAN:
         n = len(df)
         if self.delta is None:
             self.delta = min(1e-5, 1.0 / (10 * n))
+        dp_mode = hp.privacy_mode == "dp"
+
+        # ---- privacy budget split (dp mode): discriminator / minority statistics / judge ----
+        f_judge = hp.budget_frac_judge if (dp_mode and hp.judge_type == "mlp") else 0.0
+        f_stats = hp.budget_frac_stats if dp_mode else 0.0
+        if self.use_dp and dp_mode:
+            self.eps_gan = self.epsilon * (1.0 - f_judge - f_stats)
+            self.delta_gan = self.delta / 3.0
+            self.budget = {"epsilon_target": float(self.epsilon), "delta": float(self.delta),
+                           "epsilon_gan": float(self.eps_gan), "epsilon_stats": float(self.epsilon * f_stats),
+                           "epsilon_judge": float(self.epsilon * f_judge), "delta_each": float(self.delta / 3.0)}
+        else:
+            self.eps_gan, self.delta_gan = self.epsilon, self.delta
 
         labels = df[target_col].values.astype(int)
         self._minority_idx = np.where(labels == 1)[0]
         self._majority_idx = np.where(labels == 0)[0]
         self._minority_rate = len(self._minority_idx) / max(n, 1)
         min_np = data_np[self._minority_idx] if len(self._minority_idx) else data_np[:1]
-        self._min_mean = torch.tensor(min_np.mean(0), dtype=torch.float32, device=DEVICE)
-        self._min_std = torch.tensor(min_np.std(0) + 1e-6, dtype=torch.float32, device=DEVICE)
         self._cont_idx = self._norm.cont_scalar_idx
+        if self.use_dp and dp_mode:
+            mean, std, self.stats_info = minority_statistics(
+                min_np, self._cont_idx, len(self._norm.cont_cols_), len(self._norm.cat_cols_),
+                epsilon=self.epsilon * f_stats, delta=self.delta / 3.0,
+                rng=np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item())))
+            # down-weight moment matching when the released moments are dominated by noise
+            # (a function of released quantities only, i.e. post-processing)
+            self._mm_weight = 1.0 / (1.0 + (self.stats_info["rel_noise"] / hp.mm_noise_ref) ** 2)
+            self._minority_rate = min(max(self.stats_info["n_hat"] / n, 1.0 / n), 0.5)
+        else:
+            mean, std, self.stats_info = minority_statistics(min_np, self._cont_idx, 0, 0)
+        self.stats_info["mm_weight"] = float(self._mm_weight)
+        self._min_mean = torch.tensor(mean, dtype=torch.float32, device=DEVICE)
+        self._min_std = torch.tensor(std, dtype=torch.float32, device=DEVICE)
         self._real_min_corr = None
-        if len(self._cont_idx) >= 2 and len(self._minority_idx) >= 3:
+        if hp.lambda_corr > 0 and len(self._cont_idx) >= 2 and len(self._minority_idx) >= 3:
             cm = np.nan_to_num(np.corrcoef(min_np[:, self._cont_idx].T), nan=0.0)
             self._real_min_corr = torch.tensor(cm, dtype=torch.float32, device=DEVICE)
 
@@ -906,20 +1173,26 @@ class DPCTGAN:
         pe = None
         if self.use_dp:
             pe = PrivacyEngine(accountant="rdp")
-            D, opt_D, loader = pe.make_private_with_epsilon(
-                module=D, optimizer=opt_D, data_loader=loader,
-                target_epsilon=self.epsilon, target_delta=self.delta,
-                epochs=self.epochs, max_grad_norm=self.max_grad_norm)
+            if dp_mode:
+                D, opt_D, loader = make_private_dp(pe, D, opt_D, loader, self.eps_gan, self.delta_gan,
+                                                   self.epochs, self.max_grad_norm)
+            else:   # first experiment round, unchanged
+                D, opt_D, loader = pe.make_private_with_epsilon(
+                    module=D, optimizer=opt_D, data_loader=loader,
+                    target_epsilon=self.eps_gan, target_delta=self.delta_gan,
+                    epochs=self.epochs, max_grad_norm=self.max_grad_norm)
             D.grad_accumulation_allowed = True
             raw_D = D._module
             self.dp_info = {"noise_multiplier": float(opt_D.noise_multiplier),
                             "sample_rate": float(getattr(loader, "sample_rate", bs_loader / n)),
                             "steps_planned": int(self.epochs * len(loader)),
-                            "max_grad_norm": float(self.max_grad_norm), "delta": float(self.delta)}
+                            "max_grad_norm": float(self.max_grad_norm), "delta": float(self.delta_gan)}
         else:
             raw_D = D
+        eps_of = (lambda d: rdp_epsilon(pe, d)) if dp_mode else (lambda d: pe.get_epsilon(d))
 
-        self._G, self._D = G, D
+        self._G, self._D, self._raw_D = G, D, raw_D
+        need_real = hp.lambda_fm > 0 or hp.lambda_mfm > 0   # generator losses on real batches (legacy only)
         dp_tag = f"eps={self.epsilon}" if self.use_dp else "No-DP"
         if self.verbose:
             extra = f" sigma={self.dp_info['noise_multiplier']:.3f}" if self.use_dp else ""
@@ -954,42 +1227,53 @@ class DPCTGAN:
                 opt_D.zero_grad(); loss_D.backward(); opt_D.step()
                 steps_done += 1
 
-                # ---- generator step (reads real data outside the DP accountant) ----
+                # ---- generator step ----
+                # legacy: the matching losses read a real (class-balanced) batch outside the DP
+                # accountant. dp mode: no real batch; conditions are drawn with a fixed public rate.
                 bs = self.batch_size
-                rb, rb_y = self._balanced_batch(bs)
+                zero = torch.zeros((), device=DEVICE)
+                if need_real:
+                    rb, rb_y = self._balanced_batch(bs)
+                else:
+                    rb_y = (torch.rand(bs, device=DEVICE) < hp.minority_batch_frac).long()
                 cond_g = self._onehot(rb_y)
                 fake_g = G(torch.randn(bs, self.latent_dim, device=DEVICE), cond_g)
                 f_in = torch.cat([fake_g, cond_g], 1)
                 adv = bce(raw_D(f_in), torch.ones(bs, 1, device=DEVICE))
-                feat_fake = raw_D.get_features(f_in)
-                with torch.no_grad():
-                    feat_real = raw_D.get_features(torch.cat([rb, cond_g], 1))
-                fm = F.mse_loss(feat_fake.mean(0), feat_real.mean(0))
-                mmask = rb_y == 1
-                mfm = (F.l1_loss(feat_fake[mmask].mean(0), feat_real[mmask].mean(0))
-                       if int(mmask.sum()) > 1 else torch.zeros((), device=DEVICE))
+                fm = mfm = zero
+                if need_real:
+                    feat_fake = raw_D.get_features(f_in)
+                    with torch.no_grad():
+                        feat_real = raw_D.get_features(torch.cat([rb, cond_g], 1))
+                    fm = F.mse_loss(feat_fake.mean(0), feat_real.mean(0))
+                    mmask = rb_y == 1
+                    mfm = (F.l1_loss(feat_fake[mmask].mean(0), feat_real[mmask].mean(0))
+                           if int(mmask.sum()) > 1 else zero)
 
                 mm_bs = min(256, bs)
                 fake_min = G(torch.randn(mm_bs, self.latent_dim, device=DEVICE), self._cond(mm_bs, 'minority'))
                 mm_loss = (F.l1_loss(fake_min.mean(0), self._min_mean) + F.l1_loss(fake_min.std(0), self._min_std))
-                corr_loss = torch.zeros((), device=DEVICE)
+                corr_loss = zero
                 if self._real_min_corr is not None and epoch > warmup_epoch and hp.lambda_corr > 0:
                     corr_loss = F.mse_loss(_torch_corr(fake_min[:, self._cont_idx]), self._real_min_corr)
 
-                loss_G = (adv + hp.lambda_fm * fm + hp.lambda_mm * mm_loss
+                loss_G = (adv + hp.lambda_fm * fm + hp.lambda_mm * self._mm_weight * mm_loss
                           + hp.lambda_corr * corr_loss + hp.lambda_mfm * mfm)
                 opt_G.zero_grad(); loss_G.backward(); opt_G.step()
 
             if self.verbose and epoch % log_every == 0:
-                eps_s = f"  eps={pe.get_epsilon(self.delta):.3f}" if self.use_dp else ""
+                eps_s = f"  eps={eps_of(self.delta_gan):.3f}" if self.use_dp else ""
                 print(f"  ep {epoch:3d}/{self.epochs}{eps_s}")
 
-        self._actual_epsilon = pe.get_epsilon(self.delta) if self.use_dp else float('inf')
+        self._actual_epsilon = eps_of(self.delta_gan) if self.use_dp else float('inf')
         if self.use_dp:
             self.dp_info.update({"steps_done": int(steps_done), "achieved_epsilon": float(self._actual_epsilon)})
+            self._gan_history = [tuple(h) for h in pe.accountant.history]
+        self.epsilon_total = self._actual_epsilon
 
         # ---- minority fine-tuning of G with early stopping (D frozen) ----
-        if hp.finetune_epochs > 0:
+        # skipped when the (noisy) moments are too unreliable to fine-tune towards
+        if hp.finetune_epochs > 0 and self._mm_weight >= hp.finetune_min_mm_weight:
             G.train()
             opt_ft = optim.Adam(G.parameters(), lr=max(hp.gen_lr * 0.1, 1e-6))
             best, bad, best_state = float("inf"), 0, copy.deepcopy(G.state_dict())
@@ -1013,11 +1297,54 @@ class DPCTGAN:
         for p in G.parameters():
             p.requires_grad_(False)
 
+        # ---- judge for Stage 4 (dp mode; legacy mode builds its RF inside sample_rare) ----
+        if dp_mode:
+            if hp.judge_type == "mlp":
+                eps_j = self.epsilon * f_judge if self.use_dp else None
+                n_hat = self.stats_info["n_hat"]
+                pos_weight = max(n - n_hat, 1.0) / max(n_hat, 1.0)
+                self.judge = MLPJudge(self._norm, self._feat_cols, hp).fit(
+                    feat_df, labels, epsilon=eps_j, delta=self.delta / 3.0 if self.use_dp else None,
+                    pos_weight=pos_weight)
+            elif hp.judge_type == "disc":
+                self.judge = DiscJudge(self)
+            elif hp.judge_type == "rf":
+                self.judge = RFJudge(target_col, self._feat_cols).fit(df)
+            else:
+                raise ValueError(f"unknown judge_type {hp.judge_type!r}")
+
+        # ---- total privacy cost (dp mode) ----
+        if self.use_dp and dp_mode:
+            hist = list(self._gan_history) + [(self.stats_info["noise_multiplier"], 1.0, 1)]
+            eps_parts = [self._actual_epsilon, self.stats_info["epsilon"]]
+            if isinstance(self.judge, MLPJudge) and self.judge.private:
+                hist += self.judge.history
+                eps_parts.append(self.judge.info["achieved_epsilon"])
+            self.epsilon_total = float(sum(eps_parts))
+            self.budget.update({"epsilon_gan_achieved": float(self._actual_epsilon),
+                                "epsilon_total_basic": self.epsilon_total,
+                                "epsilon_total_rdp": rdp_total_epsilon(hist, self.delta),
+                                "stats_noise_multiplier": self.stats_info["noise_multiplier"],
+                                "stats_rel_noise": self.stats_info["rel_noise"],
+                                "mm_weight": float(self._mm_weight),
+                                "n_minority_hat": self.stats_info["n_hat"],
+                                "finetuned": bool(hp.finetune_epochs > 0 and
+                                                  self._mm_weight >= hp.finetune_min_mm_weight)})
+            if isinstance(self.judge, MLPJudge) and self.judge.private:
+                self.budget.update({"judge_noise_multiplier": self.judge.info["noise_multiplier"],
+                                    "judge_steps": self.judge.info["steps"],
+                                    "epsilon_judge_achieved": self.judge.info["achieved_epsilon"]})
+            if self.verbose:
+                print(f"  privacy: eps_gan={self._actual_epsilon:.3f} eps_stats={self.stats_info['epsilon']:.3f} "
+                      f"eps_judge={eps_parts[2] if len(eps_parts) > 2 else 0:.3f} -> total "
+                      f"{self.epsilon_total:.3f} (basic), {self.budget['epsilon_total_rdp']:.3f} (RDP); "
+                      f"moment noise/n={self.stats_info['rel_noise']:.3f}, mm_weight={self._mm_weight:.2f}")
+
         self._fitted = True
         self.train_seconds = time.time() - t0
         if self.verbose:
             print(f"  Training done  {self.train_seconds:.1f}s  "
-                  f"eps={'inf' if not self.use_dp else f'{self._actual_epsilon:.3f}'}")
+                  f"eps={'inf' if not self.use_dp else f'{self.epsilon_total:.3f}'}")
         return self
 
     # -- sampling -------------------------------------------------------
@@ -1116,19 +1443,19 @@ class DPCTGAN:
         return torch.cat(out)
 
     def sample_rare(self, n, df_real=None, hp: Hyperparams = None, use_flow=True, use_refine=True,
-                    use_judge=True, use_maxmin=True, return_diagnostics=False):
+                    use_judge=True, use_maxmin=True, return_diagnostics=False, judge=None):
         """Stages 1-5 of the rare-minority sampler (Stage 6, quantile matching, is applied
-        by the caller). The use_* flags switch stages off for the ablation study."""
+        by the caller). The use_* flags switch stages off for the ablation study.
+        judge: the Stage-4 judge to use. If None and use_judge, the model's own judge is used
+        (dp mode), or a non-private random forest is trained on df_real (legacy mode)."""
         hp = hp or self.hp
         assert (self.flow_min is not None) or not use_flow, "call build_flows() first"
         rng = np.random.RandomState(int(torch.randint(0, 2**31 - 1, (1,)).item()))
         clf, feat_cols = None, self._feat_cols
-        if use_judge and df_real is not None:
-            X_r = _ensure_numeric(df_real, self._target_col)[feat_cols].values.astype(float)
-            y_r = df_real[self._target_col].values.astype(int)
-            if len(np.unique(y_r)) >= 2:
-                clf = RandomForestClassifier(150, random_state=42, n_jobs=-1, class_weight="balanced")
-                clf.fit(X_r, y_r)
+        if use_judge:
+            clf = judge if judge is not None else self.judge
+            if clf is None and df_real is not None and df_real[self._target_col].nunique() >= 2:
+                clf = RFJudge(self._target_col, feat_cols).fit(df_real)
 
         pool_sz = max(hp.rare_pool_size, 2 * n)
         all_raw, all_h, all_score = [], [], []
@@ -1164,8 +1491,10 @@ class DPCTGAN:
             # Stage 4 — RF judge
             mask = np.ones(len(raw), dtype=bool)
             if clf is not None:
-                probs = clf.predict_proba(self._decode(raw)[feat_cols].values.astype(float))[:, 1]
-                thr = max(float(np.percentile(probs, 100 * (1 - hp.judge_keep_frac))), hp.judge_min_prob)
+                probs = clf.score(raw, self._decode(raw))
+                thr = float(np.percentile(probs, 100 * (1 - hp.judge_keep_frac)))
+                if clf.has_prob:
+                    thr = max(thr, hp.judge_min_prob)
                 mask = probs >= thr
                 diag["judge_prob"].append(probs[:20000])
             if mask.sum() == 0:
@@ -1304,10 +1633,11 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     rare_df = pd.DataFrame()
     try:
         model.build_flows(hp)
-        n_real_min = int(aug_df[target].sum())
+        n_real_min = model.stats_info["n_hat"] if hp.privacy_mode == "dp" else int(aug_df[target].sum())
         n_rare_need = max(200, int(n_real_min * hp.rare_multiplier))
         rare_df = model.sample_rare(n_rare_need, df_real=aug_df, hp=hp)
-        rare_df = quantile_match(rare_df, real_minority, cont_cols, blend=hp.quantile_blend, orig_df=aug_df)
+        if hp.quantile_blend > 0:
+            rare_df = quantile_match(rare_df, real_minority, cont_cols, blend=hp.quantile_blend, orig_df=aug_df)
         rare_df[target] = 1
         rare_df = postprocess_synthetic(rare_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
         if hp.privacy_filter_enabled:
@@ -1326,7 +1656,8 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     lr_mia = lr_membership_inference_attack(aug_df, final_mia_holdout, combined_df, feat)
 
     metrics = {
-        "epsilon": epsilon, "actual_epsilon": model._actual_epsilon, "dp_info": model.dp_info,
+        "epsilon": epsilon, "actual_epsilon": model.epsilon_total, "dp_info": model.dp_info,
+        "privacy_mode": hp.privacy_mode, "budget": model.budget,
         "rf_auc": tstr["auc"], "rf_auprc": tstr["auprc"], "rf_f1": tstr["f1"],
         "knn_auc": tstr["knn_auc"], "knn_auprc": tstr["knn_auprc"],
         "ks_mean": ks_mean, "js_mean": js_mean,
@@ -1358,6 +1689,8 @@ def main():
     p.add_argument("--trials", type=int, default=8)
     p.add_argument("--gan-epochs", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--mode", choices=["legacy", "dp"], default="legacy",
+                   help="'dp': every component that reads real data is covered by epsilon (see apply_privacy_mode)")
     p.add_argument("--out", type=str, default="output")
     args = p.parse_args()
 
@@ -1379,6 +1712,7 @@ def main():
         hp.gan_epochs = args.gan_epochs
     if args.delta is not None:
         hp.delta = args.delta
+    apply_privacy_mode(hp, args.mode)
     run_pipeline(cfg, epsilon, hp=hp, tune=args.tune, n_optuna_trials=args.trials, out_dir=args.out)
 
 

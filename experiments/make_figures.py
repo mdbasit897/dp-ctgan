@@ -56,7 +56,11 @@ BASELINE_STYLE = {"pategan": dict(color="#009E73", marker="^", ls="-.", label="P
                   "aim": dict(color="#E69F00", marker="D", ls=(0, (1, 1.2)), label="AIM", ms=3.2),
                   "ctgan": dict(color="#56B4E9", marker="P", ls="none", label="CTGAN (no DP)", ms=4.4),
                   "tvae": dict(color=INK, marker="X", ls="none", label="TVAE (no DP)", ms=4.2),
-                  "smote": dict(color=MUTED, marker="*", ls="none", label="SMOTE (no DP)", ms=5.2)}
+                  "smote": dict(color=MUTED, marker="*", ls="none", label="SMOTE (no DP)", ms=5.2),
+                  "sn_dpctgan": dict(color="#E69F00", marker="D", ls=(0, (1, 1.2)), label="DP-CTGAN (SmartNoise)",
+                                     ms=3.2),
+                  "sn_patectgan": dict(color="#F0E442", marker="h", ls=(0, (3, 1)), label="PATE-CTGAN (SmartNoise)"),
+                  "sn_mst": dict(color="#882255", marker="p", ls=(0, (5, 1, 1, 1)), label="MST (SmartNoise)")}
 EPS_POS = ["1", "3", "10", "nodp"]
 EPS_LBL = {"1": "1", "3": "3", "10": "10", "nodp": "No DP"}
 FULL_W, HALF_W = 6.8, 3.3   # inches (ACM text width ~ 6.8 in, column ~ 3.3 in)
@@ -164,18 +168,21 @@ def _eps_series(ax, pos, groups, st, dx=0.0, band=True, zorder=3):
     xs = _xs(pos) + dx
     ms_ = [ci95(g) for g in groups]
     m, h = np.array([v[0] for v in ms_], float), np.array([v[1] for v in ms_], float)
+    # metrics are in [0, 1]: draw intervals clipped to that range (asymmetric bars)
+    lo, hi = np.clip(m - h, 0, 1), np.clip(m + h, 0, 1)
+    h_lo, h_hi = np.nan_to_num(m - lo), np.nan_to_num(hi - m)
     ok = ~np.isnan(m)
     dp, nd = ok & np.array([e != "nodp" for e in pos]), ok & np.array([e == "nodp" for e in pos])
     mk = dict(color=st["color"], marker=st["marker"], ms=st.get("ms", 3.8), mec="white", mew=0.5)
     if dp.any():
         ax.plot(xs[dp], m[dp], ls=st.get("ls", "-"), label=st["label"], zorder=zorder, **mk)
         if band and dp.sum() > 1:
-            ax.fill_between(xs[dp], (m - h)[dp], (m + h)[dp], color=st["color"], alpha=0.14, lw=0, zorder=zorder - 1)
+            ax.fill_between(xs[dp], lo[dp], hi[dp], color=st["color"], alpha=0.14, lw=0, zorder=zorder - 1)
         elif h[dp].any():
-            ax.errorbar(xs[dp], m[dp], yerr=h[dp], fmt="none", ecolor=st["color"], elinewidth=0.8, capsize=1.8,
-                        zorder=zorder)
+            ax.errorbar(xs[dp], m[dp], yerr=[h_lo[dp], h_hi[dp]], fmt="none", ecolor=st["color"], elinewidth=0.8,
+                        capsize=1.8, zorder=zorder)
     if nd.any():
-        ax.errorbar(xs[nd], m[nd], yerr=h[nd], ls="none", elinewidth=0.8, capsize=1.8, zorder=zorder,
+        ax.errorbar(xs[nd], m[nd], yerr=[h_lo[nd], h_hi[nd]], ls="none", elinewidth=0.8, capsize=1.8, zorder=zorder,
                     label=None if dp.any() else st["label"], **mk)
 
 
@@ -276,7 +283,9 @@ def fig_ablation(df, out, eps="3", metric="rf_auprc"):
     variants = [("common", "Common only"), ("abl:plain_oversample", "+ plain minority samples"),
                 ("abl:no_flow_refine", "w/o flow + refinement"), ("abl:no_refine", "w/o refinement"),
                 ("abl:no_judge", "w/o judge"), ("abl:no_maxmin", "w/o diversity (MaxMin)"),
-                ("abl:no_qm", "w/o quantile matching"), ("combined", "Full sampler")]
+                ("abl:no_qm", "w/o quantile matching"),
+                ("abl:judge_disc", "judge = DP discriminator"),
+                ("abl:judge_rf_nonprivate", "judge = non-private RF"), ("combined", "Full sampler")]
     variants = [v for v in variants if (sub.config == v[0]).any()]
     if len(variants) < 3:
         print("  (no ablation runs found; skipping fig_ablation)")

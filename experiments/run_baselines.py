@@ -31,10 +31,10 @@ DP_METHODS = {"pategan", "dpgan", "aim", "privbayes", "sn_dpctgan", "sn_patectga
 ITER_METHODS = {"ctgan", "tvae", "dpgan"}  # synthcity plugins whose training length is set by n_iter
 
 
-def gen_synthcity(name, train, target, eps, delta, n, seed, n_iter=0):
+def gen_synthcity(name, train, target, eps, delta, n, seed, n_iter=0, extra_kwargs=None):
     from synthcity.plugins import Plugins
     from synthcity.plugins.core.dataloader import GenericDataLoader
-    kw = {"random_state": seed}
+    kw = {"random_state": seed, **(extra_kwargs or {})}
     if n_iter and name in ITER_METHODS:
         kw["n_iter"] = n_iter
     if name in DP_METHODS:
@@ -79,7 +79,7 @@ def run_one(method, ds, eps, seed, args):
     elif method.startswith("sn_"):
         synth = gen_smartnoise(method, tr, target, cat_cols, eps, len(tr))
     else:
-        synth = gen_synthcity(method, tr, target, eps, delta, len(tr), seed, args.n_iter)
+        synth = gen_synthcity(method, tr, target, eps, delta, len(tr), seed, args.n_iter, args.plugin_kwargs)
     secs = time.time() - t
     synth = synth[df.columns].copy()
     synth[target] = (pd.to_numeric(synth[target], errors="coerce").fillna(0) > 0.5).astype(int)
@@ -88,7 +88,8 @@ def run_one(method, ds, eps, seed, args):
     synth = P.postprocess_synthetic(synth, tr, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
 
     scaler = StandardScaler().fit(P._ensure_numeric(tr, target)[feat].values.astype(float))
-    R = {"meta": {"method": method, "dataset": ds, "epsilon": eps, "seed": seed, "delta": delta,
+    R = {"meta": {"method": args.name or method, "plugin": method,
+                  "plugin_kwargs": args.plugin_kwargs, "dataset": ds, "epsilon": eps, "seed": seed, "delta": delta,
                   "fit_seconds": secs, "n_synth": len(synth), "minority_rate_synth": float(synth[target].mean()),
                   "n_iter": args.n_iter if method in ITER_METHODS and args.n_iter else None},
          "utility": tstr(synth, sp, scaler, feat, target, 5, seed),
@@ -109,13 +110,19 @@ def main():
     ap.add_argument("--delta", type=float, default=None)
     ap.add_argument("--n-iter", type=int, default=300,
                     help="training epochs for ctgan / tvae / dpgan (0 = synthcity default)")
+    ap.add_argument("--plugin-kwargs", type=json.loads, default=None,
+                    help='extra synthcity plugin arguments as JSON, e.g. \'{"lamda": 0.01}\' (see probe_pategan.py)')
+    ap.add_argument("--name", default=None,
+                    help="folder/label for the results (default: the method name); one method per call")
     args = ap.parse_args()
+    if args.name and len(args.methods) != 1:
+        ap.error("--name needs exactly one --methods entry")
     for m in args.methods:
         eps_list = [parse_eps(e) for e in args.eps] if m in DP_METHODS else [None]
         for ds in args.datasets:
             for e in eps_list:
                 for s in args.seeds:
-                    d = os.path.join(args.out, m, ds, f"eps{eps_tag(e)}", f"seed{s}")
+                    d = os.path.join(args.out, args.name or m, ds, f"eps{eps_tag(e)}", f"seed{s}")
                     if os.path.exists(os.path.join(d, "metrics.json")):
                         continue
                     os.makedirs(d, exist_ok=True)

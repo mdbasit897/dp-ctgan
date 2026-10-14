@@ -6,6 +6,13 @@ containing TRTR, common, combined and (optionally) ablation results, PrivacyGate
 statistics, DP accounting, and timings. Runs are skipped if metrics.json already
 exists, so the script can be restarted after a VM preemption.
 
+Two privacy modes (see dp_ctgan_pipeline.apply_privacy_mode):
+  --mode dp      (default) every component that reads real data is covered by epsilon:
+                 DP discriminator + Gaussian-mechanism minority mean/std + DP-SGD judge;
+                 no feature/correlation/quantile matching; PrivacyGate audit only.
+                 Writes to results_dp/ unless --out is given.
+  --mode legacy  the first experiment round (writes to results/).
+
 Examples
   # smoke test (minutes, tiny settings)
   python experiments/run_experiments.py --datasets adult --eps 3 --seeds 0 --quick
@@ -28,12 +35,21 @@ from sklearn.preprocessing import StandardScaler
 from common import (DATASETS, P, eps_tag, fidelity, load, make_splits, parse_eps, privacy, tstr)
 
 ABLATIONS = {
-    # name: (sample_rare flags, apply quantile matching)
+    # name: (sample_rare flags, apply quantile matching)   -- legacy mode
     "no_qm": (dict(), False),
     "no_flow_refine": (dict(use_flow=False, use_refine=False), True),
     "no_refine": (dict(use_refine=False), True),
     "no_judge": (dict(use_judge=False), True),
     "no_maxmin": (dict(use_maxmin=False), True),
+}
+ABLATIONS_DP = {
+    # dp mode: no quantile matching anywhere; "judge" entries are filled in per run
+    "no_flow_refine": (dict(use_flow=False, use_refine=False), False),
+    "no_refine": (dict(use_refine=False), False),
+    "no_judge": (dict(use_judge=False), False),
+    "no_maxmin": (dict(use_maxmin=False), False),
+    "judge_disc": (dict(judge="disc"), False),                  # DP discriminator as judge, no extra budget
+    "judge_rf_nonprivate": (dict(judge="rf_nonprivate"), False),  # first-round RF judge (NOT private), reference
 }
 
 
@@ -56,14 +72,14 @@ def make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
     real_min = train[train[target] == 1].reset_index(drop=True)
     res = model.sample_rare(n_rare, df_real=train, hp=hp, return_diagnostics=diag, **flags)
     rare, d = res if diag else (res, None)
-    if use_qm:
+    if use_qm and hp.quantile_blend > 0:
         rare = P.quantile_match(rare, real_min, cont_cols, blend=hp.quantile_blend, orig_df=train)
     rare[target] = 1
     rare = P.postprocess_synthetic(rare, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
-    stats = None
-    if hp.privacy_filter_enabled:
-        rare, stats = P.privacy_realism_filter(rare, real_min, feat, desired_n=n_rare, label="rare",
-                                               max_ref=hp.privacy_max_ref, return_stats=True, verbose=False)
+    # dp mode: the gate only measures near-copies (filtering would be outside the budget)
+    rare, stats = P.privacy_realism_filter(rare, real_min, feat, desired_n=n_rare, label="rare",
+                                           max_ref=hp.privacy_max_ref, return_stats=True, verbose=False,
+                                           audit_only=not hp.privacy_filter_enabled)
     return rare, stats, d
 
 
@@ -83,7 +99,9 @@ def run_one(dataset, eps, seed, args):
     if os.path.exists(hp_file):
         overrides = json.load(open(hp_file))["best_params"]
         print(f"  using tuned hyperparameters from {hp_file}: {overrides}")
-    hp = P.hyperparams_for(dataset, overrides)
+    hp = P.apply_privacy_mode(P.hyperparams_for(dataset, overrides), args.mode)
+    if args.judge:
+        hp.judge_type = args.judge
     if args.quick:
         hp = quick_overrides(hp)
     if args.delta is not None:
@@ -94,7 +112,8 @@ def run_one(dataset, eps, seed, args):
         "dataset": dataset, "epsilon": eps, "seed": seed, "n_total": len(df),
         "n_train": len(train), "n_val": len(splits["val"]), "n_holdout": len(splits["holdout"]),
         "n_test": len(splits["test"]), "minority_rate_test": float(splits["test"][target].mean()),
-        "n_features": len(feat), "n_categorical": len(cat_cols), "hp": asdict(hp), "quick": args.quick}}
+        "n_features": len(feat), "n_categorical": len(cat_cols), "hp": asdict(hp), "quick": args.quick,
+        "mode": args.mode}}
     save_art = seed == args.artifact_seed
 
     t = time.time()
@@ -106,22 +125,26 @@ def run_one(dataset, eps, seed, args):
     model.fit(train, cat_cols, target, ds_name=dataset)
     timings["gan_train"] = time.time() - t
     R["meta"]["dp"] = model.dp_info
-    R["meta"]["achieved_epsilon"] = None if eps is None else float(model._actual_epsilon)
+    R["meta"]["achieved_epsilon"] = None if eps is None else float(model.epsilon_total)
+    R["meta"]["dp_budget"] = model.budget
+    R["meta"]["minority_stats"] = model.stats_info
+    R["meta"]["judge"] = model.judge.info if model.judge is not None else {"kind": "rf", "private": False}
 
     t = time.time()
     common = model.sample_common(len(train))
     common = P.postprocess_synthetic(common, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
     gate = {}
-    if hp.privacy_filter_enabled:
-        common, gate["common"] = P.privacy_realism_filter(common, train, feat, desired_n=len(train), label="common",
-                                                          max_ref=hp.privacy_max_ref, return_stats=True,
-                                                          verbose=False)
+    common, gate["common"] = P.privacy_realism_filter(common, train, feat, desired_n=len(train), label="common",
+                                                      max_ref=hp.privacy_max_ref, return_stats=True,
+                                                      verbose=False, audit_only=not hp.privacy_filter_enabled)
     timings["sample_common"] = time.time() - t
 
     t = time.time()
     model.build_flows(hp)
     timings["flows"] = time.time() - t
-    n_rare = max(200, int(train[target].sum() * hp.rare_multiplier))
+    # dp mode: the number of rare records comes from the noisy minority count (no extra budget)
+    n_min = model.stats_info["n_hat"] if args.mode == "dp" else train[target].sum()
+    n_rare = max(200, int(n_min * hp.rare_multiplier))
     t = time.time()
     rare, gate["rare"], diag = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
                                          {}, True, diag=True)
@@ -151,7 +174,13 @@ def run_one(dataset, eps, seed, args):
             plain = P.privacy_realism_filter(plain, train[train[target] == 1], feat, desired_n=n_rare,
                                              max_ref=hp.privacy_max_ref, verbose=False)
         variants = {"plain_oversample": plain}
-        for name, (flags, use_qm) in ABLATIONS.items():
+        judges = {}
+        for name, (flags, use_qm) in (ABLATIONS_DP if args.mode == "dp" else ABLATIONS).items():
+            flags = dict(flags)
+            if flags.get("judge") == "disc":
+                flags["judge"] = judges.setdefault("disc", P.DiscJudge(model))
+            elif flags.get("judge") == "rf_nonprivate":
+                flags["judge"] = judges.setdefault("rf", P.RFJudge(target, feat).fit(train))
             variants[name], _, _ = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
                                              flags, use_qm)
         for name, rv in variants.items():
@@ -190,10 +219,17 @@ def main():
     ap.add_argument("--shard", default="0/1", help="i/N: run every N-th job starting at i")
     ap.add_argument("--data-dir", default=None, help="directory with the prepared CSVs (default: ./data)")
     ap.add_argument("--hp-dir", default="results/hparams", help="tuned hyperparameters from tune.py")
-    ap.add_argument("--out", default="results")
+    ap.add_argument("--mode", choices=["dp", "legacy"], default="dp",
+                    help="dp (default): privatised pipeline; legacy: first experiment round")
+    ap.add_argument("--judge", choices=["mlp", "disc", "rf"], default=None,
+                    help="override the Stage-4 judge of the main (combined) stream")
+    ap.add_argument("--out", default=None, help="default: results_dp (dp mode) or results (legacy)")
     ap.add_argument("--delta", type=float, default=None)
     ap.add_argument("--artifact-seed", type=int, default=0, help="seed whose synthetic data/scores are saved for figures")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = "results_dp" if args.mode == "dp" else "results"
+    print(f"mode={args.mode}  out={args.out}")
 
     jobs = [(d, parse_eps(e), s) for d in args.datasets for e in args.eps for s in args.seeds]
     i, n = map(int, args.shard.split("/"))

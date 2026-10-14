@@ -11,9 +11,12 @@ Outputs (results/summary/):
   tab_gate.tex             PrivacyGate keep / near-copy / outlier rates
   tab_dp.tex               DP accounting (sigma, q, T, achieved epsilon, delta)
   tab_confusion.tex        mean confusion matrices (RF, validation-selected threshold)
-  stats.txt                Wilcoxon signed-rank tests, combined vs common
+  stats.txt                Wilcoxon signed-rank tests, combined vs common, and every ablation vs full
+  tab_budget.tex           dp mode: epsilon per component, total (basic and RDP), moment noise, judge noise
+  tab_dp_vs_legacy.tex     with --legacy-results: privatised vs first-round pipeline (RF AUPRC)
 
   python experiments/aggregate.py --results results
+  python experiments/aggregate.py --results results_dp --baselines-dir results/baselines --legacy-results results
 """
 import argparse
 import glob
@@ -56,7 +59,8 @@ def eps_key(e):
     return "nodp" if e is None else f"{float(e):g}"
 
 
-def collect(res):
+def collect(res, baselines_dir=None):
+    baselines_dir = baselines_dir or os.path.join(res, "baselines")
     rows = []
     for f in glob.glob(os.path.join(res, "*", "eps*", "seed*", "metrics.json")):
         if os.sep + "baselines" + os.sep in f:
@@ -64,7 +68,9 @@ def collect(res):
         R = json.load(open(f))
         m = R["meta"]
         base = {"method": "ours", "dataset": m["dataset"], "eps": eps_key(m["epsilon"]), "seed": m["seed"],
-                "achieved_eps": m.get("achieved_epsilon"), **{f"dp_{k}": v for k, v in (m.get("dp") or {}).items()},
+                "achieved_eps": m.get("achieved_epsilon"), "mode": m.get("mode", "legacy"),
+                **{f"dp_{k}": v for k, v in (m.get("dp") or {}).items()},
+                **{f"budget_{k}": v for k, v in (m.get("dp_budget") or {}).items()},
                 "total_min": R.get("timings_sec", {}).get("total", np.nan) / 60}
         rows.append({**base, "config": "trtr", **flat({"utility": R["trtr"]})})
         for c in ("common", "combined"):
@@ -74,7 +80,7 @@ def collect(res):
         for s, st in (R.get("privacy_gate") or {}).items():
             if st:
                 rows.append({**base, "config": f"gate:{s}", **{f"gate_{k}": v for k, v in st.items()}})
-    for f in glob.glob(os.path.join(res, "baselines", "*", "*", "eps*", "seed*", "metrics.json")):
+    for f in glob.glob(os.path.join(baselines_dir, "*", "*", "eps*", "seed*", "metrics.json")):
         R = json.load(open(f))
         m = R["meta"]
         rows.append({"method": m["method"], "config": m["method"], "dataset": m["dataset"],
@@ -133,10 +139,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default="results")
     ap.add_argument("--ablation-eps", default="3")
+    ap.add_argument("--baselines-dir", default=None, help="default: <results>/baselines")
+    ap.add_argument("--legacy-results", default=None,
+                    help="first-round results folder; adds tab_dp_vs_legacy.tex")
     a = ap.parse_args()
     out = os.path.join(a.results, "summary")
     os.makedirs(out, exist_ok=True)
-    df = collect(a.results)
+    df = collect(a.results, a.baselines_dir)
     if df.empty:
         raise SystemExit("no metrics.json found")
     df.to_csv(os.path.join(out, "runs.csv"), index=False)
@@ -176,7 +185,11 @@ def main():
     variants = [("common", "Common only"), ("abl:plain_oversample", r"+ plain $G(z,c_{\min})$ samples"),
                 ("abl:no_flow_refine", "w/o flow scoring + refinement"), ("abl:no_refine", "w/o refinement (Stage 3)"),
                 ("abl:no_judge", "w/o classifier judge"), ("abl:no_maxmin", "w/o diversity selection"),
-                ("abl:no_qm", "w/o quantile matching"), ("combined", "Full sampler")]
+                ("abl:no_qm", "w/o quantile matching"),
+                ("abl:judge_disc", "judge = DP discriminator (no extra budget)"),
+                ("abl:judge_rf_nonprivate", "judge = non-private RF (reference)"),
+                ("combined", "Full sampler")]
+    variants = [v for v in variants if (abl.config == v[0]).any()]
     lines = [r"\begin{table}[t]", r"\centering",
              f"\\caption{{Ablation of the rare-minority sampler at {EPS_TEX.get(a.ablation_eps, a.ablation_eps)} "
              r"(RF AUPRC, mean $\pm$ std over seeds; every variant adds the same number of minority records).}",
@@ -250,6 +263,50 @@ def main():
     lines += [r"\bottomrule", r"\end{tabular}"]
     open(os.path.join(out, "tab_confusion.tex"), "w").write("\n".join(lines))
 
+    # dp mode: privacy budget per component
+    bud = df[(df.method == "ours") & (df.config == "combined") & (df.eps != "nodp")]
+    if "budget_epsilon_total_rdp" in bud:
+        cols_b = [("budget_epsilon_gan_achieved", "{:.2f}"), ("budget_epsilon_stats", "{:.2f}"),
+                  ("budget_epsilon_judge_achieved", "{:.2f}"), ("budget_epsilon_total_basic", "{:.2f}"),
+                  ("budget_epsilon_total_rdp", "{:.2f}"), ("budget_stats_rel_noise", "{:.3f}"),
+                  ("budget_mm_weight", "{:.2f}"), ("budget_judge_noise_multiplier", "{:.2f}")]
+        lines = [r"\begin{tabular}{ll" + "c" * len(cols_b) + "}", r"\toprule",
+                 r"Dataset & $\varepsilon$ & $\varepsilon_{\mathrm{GAN}}$ & $\varepsilon_{\mathrm{stats}}$ & "
+                 r"$\varepsilon_{\mathrm{judge}}$ & Total (basic) & Total (RDP) & Moment noise/$n$ & "
+                 r"MM weight & Judge $\sigma$ \\", r"\midrule"]
+        for ds in datasets:
+            for e in [x for x in EPS_ORDER if x != "nodp"]:
+                s_ = bud[(bud.dataset == ds) & (bud.eps == e)]
+                if s_.empty:
+                    continue
+                cells = [(fmt.format(pd.to_numeric(s_[c]).mean()) if c in s_ and s_[c].notna().any() else "--")
+                         for c, fmt in cols_b]
+                lines.append(f"{DATASET_LABELS[ds]} & {e} & " + " & ".join(cells) + r" \\")
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        open(os.path.join(out, "tab_budget.tex"), "w").write("\n".join(lines))
+
+    # privatised vs first-round pipeline
+    if a.legacy_results:
+        leg = collect(a.legacy_results, os.path.join(a.legacy_results, "_none_"))
+        leg = leg[leg.method == "ours"]
+        ours_ = df[df.method == "ours"]
+        lines = [r"\begin{tabular}{llcccccc}", r"\toprule",
+                 r" & & \multicolumn{3}{c}{First round (non-private components)} & "
+                 r"\multicolumn{3}{c}{Privatised pipeline} \\",
+                 r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}",
+                 r"Dataset & $\varepsilon$ & Common & Combined & Gain & Common & Combined & Gain \\", r"\midrule"]
+        for ds in datasets:
+            for e in eps_list(df, ds):
+                g = lambda d_, c: pd.to_numeric(d_[(d_.dataset == ds) & (d_.eps == e) & (d_.config == c)]["rf_auprc"])
+                lc, lb, pc, pb = g(leg, "common"), g(leg, "combined"), g(ours_, "common"), g(ours_, "combined")
+                if pc.empty:
+                    continue
+                gain = lambda b_, c_: f"{b_.mean() - c_.mean():+.3f}" if len(b_) and len(c_) else "--"
+                lines.append(f"{DATASET_LABELS[ds]} & {EPS_TEX.get(e, e)} & {ms(lc)} & {ms(lb)} & {gain(lb, lc)} & "
+                             f"{ms(pc)} & {ms(pb)} & {gain(pb, pc)} \\\\")
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        open(os.path.join(out, "tab_dp_vs_legacy.tex"), "w").write("\n".join(lines))
+
     # significance: combined vs common, paired over (dataset, eps, seed)
     ours = df[df.method == "ours"]
     a_ = ours[ours.config == "combined"].set_index(["dataset", "eps", "seed"])
@@ -270,6 +327,23 @@ def main():
             dd = d.xs(ds, level="dataset") if ds in d.index.get_level_values(0) else pd.Series(dtype=float)
             if len(dd) >= 6 and not (dd == 0).all():
                 rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={wilcoxon(dd).pvalue:.2e}")
+    full_ = ours[ours.config == "combined"].set_index(["dataset", "eps", "seed"])
+    abl_cfgs = sorted(c for c in ours.config.unique() if c.startswith("abl:"))
+    if abl_cfgs:
+        rep += ["", "Ablations: variant - full sampler, paired over (dataset, eps, seed); negative = stage helps", ""]
+        for m in ["rf_auprc", "rf_auc", "knn_auprc", "rf_f1"]:
+            rep.append(f"[{m}]")
+            for v in abl_cfgs:
+                x = ours[ours.config == v].set_index(["dataset", "eps", "seed"])
+                if m not in x:
+                    continue
+                d = (pd.to_numeric(x[m]) - pd.to_numeric(full_[m])).dropna()
+                if len(d) < 6 or (d == 0).all():
+                    continue
+                per = " ".join(f"{ds[:6]}:{d.xs(ds, level=0).mean():+.3f}" for ds in datasets
+                               if ds in d.index.get_level_values(0))
+                rep.append(f"  {v[4:]:22s} n={len(d):3d} mean={d.mean():+.4f} worse-than-full={int((d < 0).sum()):3d} "
+                           f"p={wilcoxon(d).pvalue:.1e}   {per}")
     open(os.path.join(out, "stats.txt"), "w").write("\n".join(rep) + "\n")
     print("\n".join(rep))
     print(f"\nwrote tables and CSVs to {out}/")

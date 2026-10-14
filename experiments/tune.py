@@ -28,9 +28,13 @@ def main():
     ap.add_argument("--eps", nargs="+", default=["none", "1", "3", "10"])
     ap.add_argument("--trials", type=int, default=20)
     ap.add_argument("--data-dir", default=None)
-    ap.add_argument("--out", default="results/hparams")
+    ap.add_argument("--out", default=None, help="default: results/hparams (legacy) or results_dp/hparams (dp)")
+    ap.add_argument("--mode", choices=["legacy", "dp"], default="legacy",
+                    help="privacy mode the GAN is tuned in (run_experiments.py reads --hp-dir)")
     ap.add_argument("--quick", action="store_true")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = "results_dp/hparams" if args.mode == "dp" else "results/hparams"
     os.makedirs(args.out, exist_ok=True)
 
     for ds in args.datasets:
@@ -49,13 +53,13 @@ def main():
                 print(f"skip {path}")
                 continue
             P.set_seed(0)
-            hp = P.hyperparams_for(ds)
+            hp = P.apply_privacy_mode(P.hyperparams_for(ds), args.mode)
             if args.quick:
                 hp.gan_epochs = 3
             t = time.time()
             best = P.optuna_tune(e, gan_tr, sp["val"], mia_ho, sc, X_val, y_val, target, feat, cat_cols,
                                  hp, n_trials=args.trials, seed=0)
-            base = asdict(P.hyperparams_for(ds))
+            base = asdict(P.apply_privacy_mode(P.hyperparams_for(ds), args.mode))
             changed = {k: v for k, v in asdict(best).items() if base.get(k) != v}
             json.dump({"dataset": ds, "epsilon": e, "trials": args.trials, "best_params": changed,
                        "minutes": (time.time() - t) / 60}, open(path, "w"), indent=1)
