@@ -24,7 +24,8 @@ ABLATIONS = {"plain_oversample", "no_qm", "no_flow_refine", "no_refine", "no_jud
 ARTIFACTS = ["synthetic_common.csv.gz", "synthetic_rare.csv.gz", "probs.npz", "mia_scores.npz", "sampler_diag.npz"]
 TABLES = ["tab_utility.tex", "tab_fidelity_privacy.tex", "tab_ablation.tex", "tab_baselines.tex", "tab_gate.tex",
           "tab_dp.tex", "tab_confusion.tex", "stats.txt", "runs.csv", "mean_std.csv"]
-FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", "fig_mia_roc_domias", "fig_sampler_scores"] + \
+FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", "fig_mia_roc_domias", "fig_sampler_scores",
+           "fig_baselines", "fig_embedding_all"] + \
           [f"fig_{k}_{d}" for k in ("marginals", "embedding", "corrdiff") for d in DATASETS]
 BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "pategan": ["1", "3", "10"],
              "dpgan": ["1", "3", "10"], "aim": ["1", "3", "10"]}

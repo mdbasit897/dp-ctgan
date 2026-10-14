@@ -98,7 +98,7 @@ restarted after a Spot preemption or a crash by rerunning the same command.
 | `results/summary/tab_confusion.tex` | Appendix confusion matrices |
 | `results/summary/stats.txt` | Wilcoxon tests, combined vs common |
 | `results/summary/runs.csv`, `mean_std.csv` | All numbers, per run and aggregated |
-| `results/figures/fig_*.pdf` | All figures (privacy–utility, gains, ablation, MIA ROC, sampler scores, PR curves, marginals, t-SNE, correlation differences) |
+| `results/figures/fig_*.pdf` | All figures (privacy–utility, ours vs baselines, gains, ablation, MIA ROC, sampler scores, PR curves, marginals, t-SNE, correlation differences); drawn at print size (6.8 in = `\textwidth`), error bands = 95% CI over seeds |
 
 ### Evaluation protocol (per seed, stratified)
 
