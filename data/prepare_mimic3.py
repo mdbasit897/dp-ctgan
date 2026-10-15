@@ -8,7 +8,8 @@ Prerequisites
         gcloud auth application-default login            # laptop
         gcloud auth application-default login --no-launch-browser   # on a VM over SSH
     (The VM's service account does NOT have PhysioNet access.)
-  * pip install google-cloud-bigquery db-dtypes pyarrow
+  * pip install google-cloud-bigquery   (db-dtypes/pyarrow optional: without them, or if they
+    clash with NumPy 1.x, rows are read directly; do NOT upgrade NumPy in the experiment env)
 
 Usage
   python data/prepare_mimic3.py --project YOUR_GCP_PROJECT --dry-run   # cost estimate only
@@ -43,7 +44,17 @@ def main():
     if a.dry_run:
         return
 
-    df = client.query(sql).to_dataframe(create_bqstorage_client=False)
+    result = client.query(sql).result()
+    try:
+        df = result.to_dataframe(create_bqstorage_client=False)
+    except (ImportError, ValueError) as ex:
+        # to_dataframe needs db-dtypes/pyarrow, whose newest releases require NumPy >= 2. The experiment
+        # environment keeps NumPy 1.x for PyTorch/synthcity, so build the frame from plain rows instead.
+        print(f"  to_dataframe unavailable ({type(ex).__name__}); reading rows directly")
+        import pandas as pd
+        result = client.query(sql).result()
+        cols = [f.name for f in result.schema]
+        df = pd.DataFrame([dict(row.items()) for row in result], columns=cols)
     df.to_csv(a.out, index=False)
     os.chmod(a.out, 0o600)
     print(f"wrote {a.out}: {len(df):,} admissions, mortality {df['MORTALITY'].mean():.4f}")

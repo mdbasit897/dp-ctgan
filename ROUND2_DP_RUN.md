@@ -52,9 +52,8 @@ New ablation variants in every run (same GAN, same number of added minority reco
 | Tuning (`tune.py`) | **No** (optional) | the round-1 settings in `results/hparams/` are reused. Optional re-tune in dp mode: section 6 |
 | Main grid, 80 runs with ablations | **Yes** | the GAN, the judge and the statistics all changed, and round 1 did not save trained models |
 | SMOTE, CTGAN, TVAE baselines | **No** | non-private references; unaffected |
-| PATE-GAN | **Yes, after a probe** | ε = 1 and ε = 3 gave bit-identical outputs (training stopped after one iteration) |
-| DP-GAN (synthcity) | **Replace** | it collapsed to one label (95–100% minority). Use SmartNoise DP-CTGAN instead |
-| AIM | **No** | dropped (move it out of `results/baselines`, section 5) |
+| PATE-GAN, DP-GAN (synthcity) | **No, dropped** | PATE-GAN: ε = 1 and ε = 3 gave identical outputs; DP-GAN collapsed to one label. Replaced by SmartNoise |
+| AIM | **No** | dropped |
 | SmartNoise DP-CTGAN / PATE-CTGAN / MST | **New, recommended** | the direct DP competitors |
 
 Compute: about 25% more than round 1 (judge training plus two more ablation variants), so roughly 11
@@ -111,65 +110,72 @@ Runs are resumable. After a crash or preemption, run the same loop again.
 
 ## 5. Baselines
 
-### 5.1 Move AIM and the broken DP-GAN out of the baseline folder (kept on disk)
+Final baseline set: SMOTE, CTGAN, TVAE (non-private references, already done) and SmartNoise DP-CTGAN,
+PATE-CTGAN and MST (the DP competitors). synthcity PATE-GAN (ε = 1 and 3 gave identical output), DP-GAN
+(collapsed to one class) and AIM are dropped and moved out of the baseline folder (kept on disk).
+
+### 5.1 Move the dropped baselines out (VM, main environment)
 
 ```bash
+cd ~/projects/dp-ctgan
 mkdir -p results/_excluded
-mv results/baselines/aim   results/_excluded/aim
-mv results/baselines/dpgan results/_excluded/dpgan
+mv results/baselines/pategan results/baselines/dpgan results/_excluded/
+mv results/baselines/NOTE_aim_credit_fraud.txt results/_excluded/ 2>/dev/null
+ls results/baselines        # ctgan  smote  tvae
 ```
 
-### 5.2 PATE-GAN: find settings that actually train, then re-run
+### 5.2 SmartNoise environment (separate; leaves the main environment untouched)
 
-```bash
-mv results/baselines/pategan results/_excluded/pategan_round1
-python3 experiments/probe_pategan.py --dataset adult
-```
-
-The probe prints synthcity's PATE-GAN parameters, then fits it at ε = 1 and ε = 3 for each candidate
-setting and says whether the outputs differ. If none of the default candidates says
-`outputs differ (usable)`, pass your own grid using the parameter names it printed, for example:
-
-```bash
-python3 experiments/probe_pategan.py --grid '{"lamda": [0.0001, 0.001, 0.01], "n_teachers": [10, 50, 100]}'
-```
-
-Pick the setting with different outputs and the best validation AUPRC, then run all datasets with it:
-
-```bash
-nohup python3 experiments/run_baselines.py --methods pategan --eps 1 3 10 --seeds 0 1 2 \
-    --plugin-kwargs '{"lamda": 0.01}' --out results/baselines > logs/bl_pategan_r2.log 2>&1 &
-```
-
-The settings are stored in each `metrics.json` (`meta.plugin_kwargs`); report them in the paper. If no setting
-makes ε = 1 and ε = 3 differ, keep the default runs but say in the paper that synthcity's PATE-GAN stops after
-its first iteration at ε ≤ 3.
-
-### 5.3 SmartNoise DP-CTGAN, PATE-CTGAN, MST (replaces DP-GAN)
-
-SmartNoise pins its own torch/opacus versions, so give it its own environment:
+smartnoise-synth 1.0.8 pins opacus 0.14 and pulls a recent torch and NumPy 2, so it must not go into the main
+environment. `--torch-backend auto` picks the torch build that matches the VM's NVIDIA driver (download of a
+few GB, about 10 minutes).
 
 ```bash
 uv venv --python 3.11 .venv-sn
-uv pip install --python .venv-sn/bin/python smartnoise-synth scikit-learn pandas scipy
-.venv-sn/bin/python -c "from snsynth import Synthesizer; print('snsynth ok')"
-
-# test one run first
-.venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan --datasets adult --eps 3 --seeds 0 \
-    --out results/baselines
-cat results/baselines/sn_dpctgan/adult/eps3/seed0/error.txt 2>/dev/null   # empty = OK
-
-nohup .venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan sn_patectgan sn_mst \
-    --eps 1 3 10 --seeds 0 1 2 --out results/baselines > logs/bl_smartnoise.log 2>&1 &
+uv pip install --python .venv-sn/bin/python --torch-backend auto smartnoise-synth scikit-learn pandas scipy
+.venv-sn/bin/python -c "import snsynth, torch; print('snsynth ok, torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 ```
 
-If `smartnoise-synth` will not install on Python 3.11, try `--python 3.10`. If one method fails on one
-dataset (MST needs every column discretised; it bins continuous columns with a small share of ε), read
-`error.txt`; a method that cannot run can be left out, since tables and figures only include methods with results.
-These SmartNoise calls were written against the documented API but could not be tested here; check the first
-run before launching all of them.
+If the last line fails with a CUDA/driver error, reinstall with `--torch-backend cpu` (MST is CPU-only anyway;
+DP-CTGAN and PATE-CTGAN then run slower but correctly).
 
----
+### 5.3 Smoke test: one run per method on Adult
+
+```bash
+for m in sn_mst sn_dpctgan sn_patectgan; do
+  .venv-sn/bin/python experiments/run_baselines.py --methods $m --datasets adult --eps 3 --seeds 0 --out results/baselines
+done
+ls results/baselines/sn_*/adult/eps3/seed0/                       # each should contain metrics.json
+cat results/baselines/sn_*/adult/eps3/seed0/error.txt 2>/dev/null  # must print nothing
+```
+
+### 5.4 Full run: 3 methods × 4 datasets × ε ∈ {1, 3, 10} × 3 seeds = 108 runs
+
+One process per method, in parallel. Finished runs (including the smoke tests) are skipped.
+
+```bash
+mkdir -p logs
+for m in sn_mst sn_dpctgan sn_patectgan; do
+  nohup env PYTHONUNBUFFERED=1 OMP_NUM_THREADS=8 \
+    .venv-sn/bin/python experiments/run_baselines.py --methods $m --eps 1 3 10 --seeds 0 1 2 \
+      --out results/baselines > logs/bl_$m.log 2>&1 &
+done
+```
+
+Monitor:
+
+```bash
+for m in sn_mst sn_dpctgan sn_patectgan; do
+  echo "$m: $(ls results/baselines/$m/*/eps*/seed*/metrics.json 2>/dev/null | wc -l)/36 done," \
+       "$(ls results/baselines/$m/*/eps*/seed*/error.txt 2>/dev/null | wc -l) errors," \
+       "now: $(grep '^=== ' logs/bl_$m.log | tail -1)"
+done
+pgrep -fa run_baselines.py | wc -l      # 0 = all finished
+```
+
+A failed run leaves `error.txt` and is retried when the loop is started again. Delete the old error files
+first (`rm results/baselines/sn_*/*/eps*/seed*/error.txt`). If a method keeps failing on one dataset, it can be
+left out: the tables only include runs that have results.
 
 ## 6. Optional: re-tune in dp mode
 

@@ -30,9 +30,9 @@ TABLES = ["tab_utility.tex", "tab_fidelity_privacy.tex", "tab_ablation.tex", "ta
 FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", "fig_mia_roc_domias", "fig_sampler_scores",
            "fig_baselines", "fig_embedding_all"] + \
           [f"fig_{k}_{d}" for k in ("marginals", "embedding", "corrdiff") for d in DATASETS]
-BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "pategan": ["1", "3", "10"],
-             "dpgan": ["1", "3", "10"], "sn_dpctgan": ["1", "3", "10"], "sn_patectgan": ["1", "3", "10"],
-             "sn_mst": ["1", "3", "10"]}
+# synthcity PATE-GAN / DP-GAN and AIM were dropped (degenerate or infeasible runs; kept in results/_excluded)
+BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "sn_dpctgan": ["1", "3", "10"],
+             "sn_patectgan": ["1", "3", "10"], "sn_mst": ["1", "3", "10"]}
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--baseline-seeds", type=int, default=3, help="number of seeds the baselines are run with")
