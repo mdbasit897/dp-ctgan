@@ -197,9 +197,15 @@ done; wait
 ```bash
 python3 experiments/aggregate.py --results results_dp --baselines-dir results/baselines \
     --legacy-results results --ablation-eps 3
+rm -rf results_dp/figures          # removes figures that are no longer drawn (sampler scores, MIMIC t-SNE)
 python3 experiments/make_figures.py --results results_dp --fig-eps 3
 cat results_dp/summary/stats.txt
 ```
+
+Seed-level figures (PR curves, attack ROC, marginals, correlations, t-SNE) use the seed-0 artefacts and leave
+out a dataset whose seed-0 run has a degenerate rare stream; the script prints which one (at ε = 3:
+Credit Card Fraud, where the private judge accepted a single candidate). The t-SNE figure leaves out MIMIC-III
+by default because it plots real patient records. `fig_sampler_scores` is only drawn with `--sampler-fig`.
 
 New outputs in `results_dp/summary/`:
 
@@ -208,6 +214,8 @@ New outputs in `results_dp/summary/`:
 | `tab_budget.tex` | ε per component (discriminator, statistics, judge), total by basic and RDP composition, moment noise / n, MM weight, judge noise multiplier |
 | `tab_dp_vs_legacy.tex` | RF AUPRC common / combined / gain: round 1 vs privatised pipeline, per dataset and ε |
 | `tab_ablation.tex` | now includes "judge = DP discriminator" and "judge = non-private RF (reference)" |
+| `tab_baseline_minority.tex` | synthetic minority rate of every baseline |
+| `tab_dp.tex` | DP-SGD accounting of the discriminator only (its δ and ε share); totals are in `tab_budget.tex` |
 | `stats.txt` | combined vs common, plus every ablation vs the full sampler (paired Wilcoxon) |
 
 All other tables and figures are as in round 1, now in `results_dp/`.

@@ -2,6 +2,7 @@
 """Publication figures from the experiment results (vector PDF + PNG preview).
 
   python experiments/make_figures.py --results results --fig-eps 3
+  python experiments/make_figures.py --results results_dp --fig-eps 3        # round 2 (dp mode)
 
 Figures (results/figures/):
   fig_privacy_utility.pdf   RF AUPRC vs privacy budget, common vs combined, real-data reference
@@ -10,19 +11,26 @@ Figures (results/figures/):
   fig_ablation.pdf          ablation of the sampler (needs --ablations runs)
   fig_pr_curves.pdf         test precision-recall curves with AP: real data, common, combined (seed 0)
   fig_mia_roc_domias.pdf    DOMIAS-style attack ROC on log-FPR axes with AUC, common vs combined (seed 0)
-  fig_sampler_scores.pdf    flow likelihood-ratio scores: pool, before/after refinement, selected
+  fig_sampler_scores.pdf    flow likelihood-ratio scores (only with --sampler-fig)
   fig_marginals_<ds>.pdf    minority-class marginals with KS: real vs common vs rare stream
   fig_embedding_<ds>.pdf    t-SNE of real minority, common-stream minority and rare stream
-  fig_embedding_all.pdf     the four t-SNE panels side by side
+  fig_embedding_all.pdf     the t-SNE panels side by side (--embedding-datasets; MIMIC-III is left out by
+                            default because the panel plots real patient records)
   fig_corrdiff_<ds>.pdf     |corr(real) - corr(synthetic)| (lower triangle) for common and combined
 
 Style: serif text close to the ACM template font (Linux Libertine if installed, else STIX),
 the Okabe-Ito colour-blind-safe palette, and a distinct marker / line style for every series so
 the figures stay readable in greyscale print. Figures are drawn at their printed size
 (6.8 in = ACM text width; 3.3 in = one column), so include them with width=\\textwidth or
-\\columnwidth and the fonts print at 6.5-8 pt. Error bands and bars are 95% t-intervals over seeds.
+\\columnwidth and the fonts print at 6.5-8 pt. Error bands and bars are 95% t-intervals over seeds, except in
+fig_baselines, which shows mean +- std (the baselines have only 3 seeds, so t-intervals would be very wide).
+
+Seed-level figures use the artefacts of one seed (--seed). A dataset is skipped there, with a message, when
+that run's rare stream is degenerate (the sampler fell back to plain sampling or returned < 100 records), so
+that a figure never shows a failed run as if it were typical.
 """
 import argparse
+import json
 import os
 
 import matplotlib
@@ -127,7 +135,7 @@ def top_legend(fig, axes, ncol, handles=None, labels=None, y=1.0):
     fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, y), ncol=ncol)
 
 
-def note(ax, lines, loc="lower left", y0=None):
+def note(ax, lines, loc="lower left", y0=None, box=False):
     """Coloured value annotations, e.g. [("AP 0.74", colour), ...], stacked in a panel corner
     (y0: axes-fraction height of the first line instead of the corner)."""
     x, ha = (0.04, "left") if "left" in loc else (0.96, "right")
@@ -137,7 +145,8 @@ def note(ax, lines, loc="lower left", y0=None):
             y = y0 - 0.1 * k
         else:
             y = (0.95 - 0.1 * k) if top else (0.05 + 0.1 * (len(lines) - 1 - k))
-        ax.text(x, y, txt, color=c, fontsize=6.3, ha=ha, va="top" if top else "bottom", transform=ax.transAxes)
+        ax.text(x, y, txt, color=c, fontsize=6.3, ha=ha, va="top" if top else "bottom", transform=ax.transAxes,
+                zorder=6, bbox=dict(fc="white", ec="none", alpha=0.85, pad=0.6) if box else None)
 
 
 # ---- privacy-budget axis helpers ---------------------------------------------------------------
@@ -162,11 +171,18 @@ def _eps_axis(ax, pos):
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
 
 
-def _eps_series(ax, pos, groups, st, dx=0.0, band=True, zorder=3):
-    """Mean over seeds per budget. DP budgets are joined by a line with a 95% CI band (or bars);
-    the No-DP point stands alone, because it is not part of the epsilon scale."""
+def mean_std(x):
+    x = np.asarray(pd.to_numeric(pd.Series(x), errors="coerce").dropna())
+    if len(x) < 2:
+        return (x.mean() if len(x) else np.nan), 0.0
+    return x.mean(), x.std(ddof=1)
+
+
+def _eps_series(ax, pos, groups, st, dx=0.0, band=True, zorder=3, spread=ci95):
+    """Mean over seeds per budget. DP budgets are joined by a line with a band (or bars) given by
+    `spread` (95% CI by default); the No-DP point stands alone, because it is not part of the epsilon scale."""
     xs = _xs(pos) + dx
-    ms_ = [ci95(g) for g in groups]
+    ms_ = [spread(g) for g in groups]
     m, h = np.array([v[0] for v in ms_], float), np.array([v[1] for v in ms_], float)
     # metrics are in [0, 1]: draw intervals clipped to that range (asymmetric bars)
     lo, hi = np.clip(m - h, 0, 1), np.clip(m + h, 0, 1)
@@ -219,9 +235,9 @@ def fig_baselines(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)"):
         for meth in meths:
             s = sub[sub.method == meth]
             _eps_series(ax, pos, [s[s.eps == e][metric] for e in pos], BASELINE_STYLE[meth], dx=offs[meth], band=False,
-                        zorder=3)
+                        zorder=3, spread=mean_std)
         s = sub[(sub.method == "ours") & (sub.config == "combined")]
-        _eps_series(ax, pos, [s[s.eps == e][metric] for e in pos], ours, zorder=5)
+        _eps_series(ax, pos, [s[s.eps == e][metric] for e in pos], ours, zorder=5, spread=mean_std)
         ax.axhline(sub[(sub.method == "ours") & (sub.config == "trtr")][metric].mean(), color=REAL, ls=":", lw=1.1,
                    label=STYLE["trtr"]["label"], zorder=2)
         _eps_axis(ax, pos)
@@ -324,8 +340,24 @@ def art(results, ds, eps, seed, name):
     return p if os.path.exists(p) else None
 
 
-def fig_pr_curves(results, out, eps, seed):
-    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "probs.npz")]
+_SKIPPED = set()
+
+
+def usable(results, ds, eps, seed, datasets):
+    """Datasets selected for seed-level figures whose artefact run has a working rare stream."""
+    if ds not in datasets or not art(results, ds, eps, seed, "metrics.json"):
+        return False
+    n_rare = json.load(open(art(results, ds, eps, seed, "metrics.json")))["meta"].get("n_rare", 0)
+    ok = n_rare >= 100 and art(results, ds, eps, seed, "sampler_diag.npz") is not None
+    if not ok and ds not in _SKIPPED:
+        _SKIPPED.add(ds)
+        print(f"  skipping {ds} in seed-level figures: eps={eps} seed={seed} has a degenerate rare stream "
+              f"(n_rare={n_rare}{', sampler fell back to plain sampling' if n_rare >= 100 else ''})")
+    return ok
+
+
+def fig_pr_curves(results, out, eps, seed, datasets=DATASETS):
+    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "probs.npz") and usable(results, d, eps, seed, datasets)]
     if not ds_list:
         return
     fig, axes = plt.subplots(1, len(ds_list), figsize=(FULL_W, 2.0), squeeze=False, sharey=True,
@@ -341,7 +373,7 @@ def fig_pr_curves(results, out, eps, seed):
                     zorder=3 if cfg == "combined" else 2)
             aps.append((f"{st['short']}  AP {average_precision_score(y, z[key]):.3f}", st["color"]))
         ax.axhline(y.mean(), color=LIGHT, lw=0.8, ls=(0, (3, 2)), zorder=1, label="Prevalence")
-        note(ax, aps, "lower left", y0=0.62)
+        note(ax, aps, "upper right", box=True)
         ax.set_xlim(0, 1); ax.set_ylim(0, 1.02)
         ax.grid(axis="x", visible=True)
         panel_title(ax, i, DATASET_LABELS[ds])
@@ -351,8 +383,9 @@ def fig_pr_curves(results, out, eps, seed):
     save(fig, out, "fig_pr_curves")
 
 
-def fig_mia_roc(results, out, eps, seed, attack="domias"):
-    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "mia_scores.npz")]
+def fig_mia_roc(results, out, eps, seed, attack="domias", datasets=DATASETS):
+    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "mia_scores.npz")
+               and usable(results, d, eps, seed, datasets)]
     if not ds_list:
         return
     fig, axes = plt.subplots(1, len(ds_list), figsize=(FULL_W, 2.0), squeeze=False, sharey=True,
@@ -379,8 +412,9 @@ def fig_mia_roc(results, out, eps, seed, attack="domias"):
     save(fig, out, f"fig_mia_roc_{attack}")
 
 
-def fig_sampler_scores(results, out, eps, seed):
-    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "sampler_diag.npz")]
+def fig_sampler_scores(results, out, eps, seed, datasets=DATASETS):
+    ds_list = [d for d in DATASETS if art(results, d, eps, seed, "sampler_diag.npz")
+               and usable(results, d, eps, seed, datasets)]
     if not ds_list:
         return
     fig, axes = plt.subplots(1, len(ds_list), figsize=(FULL_W, 1.85), squeeze=False, layout="constrained")
@@ -487,9 +521,11 @@ def _legend_handles(groups):
             [g[0] for g in groups])
 
 
-def fig_embeddings(results, out, eps, seed, data_dir):
+def fig_embeddings(results, out, eps, seed, data_dir, datasets=DATASETS):
     emb = {}
     for ds in DATASETS:
+        if not usable(results, ds, eps, seed, datasets):
+            continue
         e = _embedding(results, ds, eps, seed, data_dir)
         if e is None:
             continue
@@ -501,7 +537,7 @@ def fig_embeddings(results, out, eps, seed, data_dir):
         ax.legend(h, lab, loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=1)
         save(fig, out, f"fig_embedding_{ds}")
     if len(emb) > 1:
-        fig, axes = plt.subplots(1, len(emb), figsize=(FULL_W, FULL_W / len(emb) + 0.1), squeeze=False,
+        fig, axes = plt.subplots(1, len(emb), figsize=(FULL_W, min(FULL_W / len(emb), 2.6) + 0.1), squeeze=False,
                                  layout="constrained")
         for i, (ax, (ds, e)) in enumerate(zip(axes[0], emb.items())):
             _scatter_embedding(ax, *e)
@@ -556,6 +592,12 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--ablation-eps", default="3")
+    ap.add_argument("--fig-datasets", nargs="+", default=DATASETS,
+                    help="datasets shown in the seed-level figures (PR, attack ROC, marginals, correlations)")
+    ap.add_argument("--embedding-datasets", nargs="+", default=["adult", "taiwan_credit", "credit_fraud"],
+                    help="datasets in the t-SNE figures (default leaves out MIMIC-III: the panel plots real patients)")
+    ap.add_argument("--sampler-fig", action="store_true",
+                    help="also draw fig_sampler_scores (flow scores; the ablation shows the flows do not matter)")
     a = ap.parse_args()
     out = os.path.join(a.results, "figures")
     os.makedirs(out, exist_ok=True)
@@ -569,13 +611,15 @@ def main():
         fig_ablation(df, out, a.ablation_eps)
     else:
         print("  run experiments/aggregate.py first for the summary figures")
-    fig_pr_curves(a.results, out, a.fig_eps, a.seed)
-    fig_mia_roc(a.results, out, a.fig_eps, a.seed)
-    fig_sampler_scores(a.results, out, a.fig_eps, a.seed)
+    fig_pr_curves(a.results, out, a.fig_eps, a.seed, a.fig_datasets)
+    fig_mia_roc(a.results, out, a.fig_eps, a.seed, datasets=a.fig_datasets)
+    if a.sampler_fig:
+        fig_sampler_scores(a.results, out, a.fig_eps, a.seed, a.fig_datasets)
     for ds in DATASETS:
-        fig_marginals(a.results, out, ds, a.fig_eps, a.seed, a.data_dir)
-        fig_corrdiff(a.results, out, ds, a.fig_eps, a.seed, a.data_dir)
-    fig_embeddings(a.results, out, a.fig_eps, a.seed, a.data_dir)
+        if usable(a.results, ds, a.fig_eps, a.seed, a.fig_datasets):
+            fig_marginals(a.results, out, ds, a.fig_eps, a.seed, a.data_dir)
+            fig_corrdiff(a.results, out, ds, a.fig_eps, a.seed, a.data_dir)
+    fig_embeddings(a.results, out, a.fig_eps, a.seed, a.data_dir, a.embedding_datasets)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@ Outputs (results/summary/):
   tab_utility.tex          TRTR / common / combined utility (manuscript Table "utility")
   tab_fidelity_privacy.tex fidelity + membership inference (manuscript Table "fidelity")
   tab_ablation.tex         ablation table
-  tab_baselines.tex        ours vs baselines
-  tab_gate.tex             PrivacyGate keep / near-copy / outlier rates
-  tab_dp.tex               DP accounting (sigma, q, T, achieved epsilon, delta)
+  tab_baselines.tex        ours vs baselines (readable names; non-private methods marked with a dagger)
+  tab_baseline_minority.tex  synthetic minority rate of every baseline (degenerate class balance shows up here)
+  tab_gate.tex             PrivacyGate near-copy / outlier rates (dp mode: audit only, nothing removed)
+  tab_dp.tex               DP-SGD accounting of the discriminator (sigma, q, T, delta, epsilon)
   tab_confusion.tex        mean confusion matrices (RF, validation-selected threshold)
-  stats.txt                Wilcoxon signed-rank tests, combined vs common, and every ablation vs full
+  stats.txt                Wilcoxon signed-rank tests, combined vs common (per-dataset p-values also
+                           Holm-adjusted over the four datasets), and every ablation vs full
   tab_budget.tex           dp mode: epsilon per component, total (basic and RDP), moment noise, judge noise
   tab_dp_vs_legacy.tex     with --legacy-results: privatised vs first-round pipeline (RF AUPRC)
 
@@ -30,6 +32,10 @@ from scipy.stats import wilcoxon
 from common import DATASET_LABELS, DATASETS
 
 EPS_ORDER = ["nodp", "10", "3", "1"]
+BASELINE_NAMES = {"sn_dpctgan": "DP-CTGAN (SmartNoise)", "sn_patectgan": "PATE-CTGAN (SmartNoise)",
+                  "sn_mst": "MST (SmartNoise)", "ctgan": r"CTGAN$^\dagger$", "tvae": r"TVAE$^\dagger$",
+                  "smote": r"SMOTE$^\dagger$", "pategan": "PATE-GAN", "dpgan": "DP-GAN", "aim": "AIM"}
+BASELINE_ORDER = ["sn_dpctgan", "sn_patectgan", "sn_mst", "pategan", "dpgan", "aim", "ctgan", "tvae", "smote"]
 EPS_TEX = {"nodp": "No-DP", "10": r"$\varepsilon=10$", "3": r"$\varepsilon=3$", "1": r"$\varepsilon=1$",
            "5": r"$\varepsilon=5$"}
 
@@ -84,7 +90,8 @@ def collect(res, baselines_dir=None):
         R = json.load(open(f))
         m = R["meta"]
         rows.append({"method": m["method"], "config": m["method"], "dataset": m["dataset"],
-                     "eps": eps_key(m["epsilon"]), "seed": m["seed"], **flat(R)})
+                     "eps": eps_key(m["epsilon"]), "seed": m["seed"],
+                     "minority_rate_synth": m.get("minority_rate_synth"), **flat(R)})
     return pd.DataFrame(rows)
 
 
@@ -130,6 +137,18 @@ LOWER_BETTER = {"ks", "js", "ks_minority", "js_minority", "corr_diff", "disc_auc
                 "lr_mia_auc", "domias_tpr@0.01", "knn_mia_tpr@0.01", "dcr_share"}
 
 
+def holm(pvals):
+    """Holm-Bonferroni adjusted p-values (same order as the input)."""
+    p = np.asarray(pvals, float)
+    order = np.argsort(p)
+    adj = np.empty_like(p)
+    running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(p) - rank) * p[i]))
+        adj[i] = running
+    return adj
+
+
 def eps_list(df, ds):
     present = df[df.dataset == ds].eps.unique().tolist()
     return [e for e in EPS_ORDER if e in present] + sorted(set(present) - set(EPS_ORDER))
@@ -171,14 +190,16 @@ def main():
 
     # fidelity + privacy
     keys = [k for k in keys if k[2] != "trtr"]
-    cols = ["ks", "js", "corr_diff", "disc_auc", "knn_mia_auc", "domias_auc", "domias_tpr@0.01", "lr_mia_auc",
+    # (the discriminator AUC is about 0.98-1.0 for every generator, baselines included, so it does not
+    #  discriminate between methods; it stays in runs.csv / mean_std.csv but not in the table)
+    cols = ["ks", "ks_minority", "js", "corr_diff", "knn_mia_auc", "domias_auc", "domias_tpr@0.01", "lr_mia_auc",
             "dcr_share"]
-    hdr = (r"Dataset & Configuration & KS & JS & Corr.\ diff. & Disc.\ AUC & kNN-MIA AUC & DOMIAS AUC & "
+    hdr = (r"Dataset & Configuration & KS & KS (minority) & JS & Corr.\ diff. & kNN-MIA AUC & DOMIAS AUC & "
            r"DOMIAS TPR@1\% & LR-MIA AUC & DCR share")
     open(os.path.join(out, "tab_fidelity_privacy.tex"), "w").write(table(
         df[df.method == "ours"], keys, cols, hdr,
-        "Fidelity (lower is better) and membership inference (AUC 0.5 and DCR share 0.5 = no measurable leakage); "
-        "mean $\\pm$ std over seeds.", "tab:fidelity", pair))
+        "Fidelity (lower is better; KS (minority) compares the minority class only) and membership inference "
+        "(AUC 0.5 and DCR share 0.5 = no measurable leakage); mean $\\pm$ std over seeds.", "tab:fidelity", pair))
 
     # ablation
     abl = df[(df.method == "ours") & (df.eps == a.ablation_eps)]
@@ -202,26 +223,52 @@ def main():
     open(os.path.join(out, "tab_ablation.tex"), "w").write("\n".join(lines))
 
     # baselines
-    meths = [m for m in df.method.unique() if m != "ours"]
+    present = [m for m in df.method.unique() if m != "ours"]
+    meths = [m for m in BASELINE_ORDER if m in present] + sorted(set(present) - set(BASELINE_ORDER))
     if meths:
+        n_seeds = {m: int(df[df.method == m].groupby(["dataset", "eps"]).seed.nunique().max()) for m in ["ours"] + meths}
         keys = []
         for ds in datasets:
             for e in eps_list(df, ds):
                 keys.append((ds, e, "combined", f"{EPS_TEX.get(e, e)}, ours"))
-                keys += [(ds, e, m, f"{EPS_TEX.get(e, e)}, {m}") for m in meths]
+                keys += [(ds, e, m, f"{EPS_TEX.get(e, e)}, {BASELINE_NAMES.get(m, m)}") for m in meths]
+        seeds_txt = ", ".join(f"{BASELINE_NAMES.get(m, m) if m != 'ours' else 'ours'}: {n_seeds[m]}"
+                              for m in ["ours"] + meths)
         open(os.path.join(out, "tab_baselines.tex"), "w").write(table(
             df, keys, ["rf_auc", "rf_auprc", "rf_f1", "ks", "domias_auc", "dcr_share"],
             r"Dataset & Setting & RF AUC & RF AUPRC & RF F1 & KS & DOMIAS AUC & DCR share",
-            "Comparison with baselines on identical splits and evaluation (mean $\\pm$ std over seeds). "
-            "Non-private methods (ctgan, tvae, smote) are listed under No-DP.", "tab:baselines"))
+            "Comparison with baselines on identical splits and evaluation (mean $\\pm$ std over seeds; seeds per "
+            f"setting: {seeds_txt}). SmartNoise generators use their default settings. "
+            r"$^\dagger$Not differentially private (listed under No-DP); SMOTE interpolates real training records "
+            "and is a utility reference, not a private release.", "tab:baselines"))
+        # synthetic minority rate (class balance of each generator's output)
+        mr = df[df.method.isin(meths)]
+        lines = [r"\begin{tabular}{ll" + "c" * len(meths) + "}", r"\toprule",
+                 "Dataset & Setting & " + " & ".join(BASELINE_NAMES.get(m, m) for m in meths) + r" \\", r"\midrule"]
+        for ds in datasets:
+            for e in eps_list(mr, ds):
+                cells = []
+                for m in meths:
+                    v = pd.to_numeric(mr[(mr.dataset == ds) & (mr.eps == e) & (mr.method == m)]["minority_rate_synth"])
+                    cells.append(f"{v.mean():.4f}" if v.notna().any() else "--")
+                lines.append(f"{DATASET_LABELS[ds]} & {EPS_TEX.get(e, e)} & " + " & ".join(cells) + r" \\")
+        lines += [r"\bottomrule", r"\end{tabular}"]
+        open(os.path.join(out, "tab_baseline_minority.tex"), "w").write("\n".join(lines))
 
     # PrivacyGate and DP accounting
-    lines = [r"\begin{table}[t]", r"\centering", r"\caption{PrivacyGate statistics (fraction of candidate records "
-             r"kept, removed as near-copies, removed as outliers; mean over seeds).}", r"\label{tab:gate}", r"\small",
+    dp_mode = (df[df.method == "ours"]["mode"] == "dp").any() if "mode" in df else False
+    cap = (r"\caption{PrivacyGate audit: fraction of synthetic records that the gate flags as near-copies of training "
+           r"records or as outliers (mean over seeds). In the privatised pipeline the gate only audits; no record is "
+           r"removed.}" if dp_mode else
+           r"\caption{PrivacyGate statistics (fraction of candidate records kept, removed as near-copies, removed as "
+           r"outliers; mean over seeds).}")
+    keep_lbl = "Unflagged" if dp_mode else "Keep"
+    lines = [r"\begin{table}[t]", r"\centering", cap, r"\label{tab:gate}", r"\small",
              r"\begin{tabular}{llcccccc}", r"\toprule",
              r" & & \multicolumn{3}{c}{Common stream} & \multicolumn{3}{c}{Rare stream} \\",
              r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}",
-             r"Dataset & Setting & Keep & Near-copy & Outlier & Keep & Near-copy & Outlier \\", r"\midrule"]
+             f"Dataset & Setting & {keep_lbl} & Near-copy & Outlier & {keep_lbl} & Near-copy & Outlier \\\\",
+             r"\midrule"]
     gate = df[df.config.str.startswith("gate:")]
     for ds in datasets:
         for e in eps_list(df, ds):
@@ -236,14 +283,27 @@ def main():
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     open(os.path.join(out, "tab_gate.tex"), "w").write("\n".join(lines))
 
-    dp = df[(df.config == "combined") & (df.eps != "nodp")]
-    lines = [r"\begin{tabular}{llccccc}", r"\toprule",
-             r"Dataset & Target $\varepsilon$ & $\delta$ & $\sigma$ & $q$ & $T$ & Achieved $\varepsilon$ \\", r"\midrule"]
-    for (ds, e), s in dp.groupby(["dataset", "eps"]):
-        g_ = lambda k, fmt: (fmt.format(pd.to_numeric(s[k]).mean()) if k in s else "--")
-        lines.append(f"{DATASET_LABELS[ds]} & {e} & {g_('dp_delta', '{:.1e}')} & {g_('dp_noise_multiplier', '{:.3f}')} "
-                     f"& {g_('dp_sample_rate', '{:.4f}')} & {g_('dp_steps_done', '{:.0f}')} & "
-                     f"{g_('achieved_eps', '{:.3f}')} \\\\")
+    # DP-SGD accounting of the discriminator. dp mode: delta and epsilon of the discriminator's share of the
+    # budget (the totals over all components are in tab_budget.tex); legacy mode: the discriminator is the whole budget.
+    dp = df[(df.method == "ours") & (df.config == "combined") & (df.eps != "nodp")]
+    if dp_mode:
+        hdr_dp = (r"Dataset & Target $\varepsilon$ & $\sigma$ & $q$ & $T$ & $\delta_{\mathrm{GAN}}$ & "
+                  r"$\varepsilon_{\mathrm{GAN}}$ \\")
+        cols_dp = [("dp_noise_multiplier", "{:.3f}"), ("dp_sample_rate", "{:.4f}"), ("dp_steps_done", "{:.0f}"),
+                   ("budget_delta_each", "{:.1e}"), ("budget_epsilon_gan_achieved", "{:.3f}")]
+    else:
+        hdr_dp = r"Dataset & Target $\varepsilon$ & $\sigma$ & $q$ & $T$ & $\delta$ & Achieved $\varepsilon$ \\"
+        cols_dp = [("dp_noise_multiplier", "{:.3f}"), ("dp_sample_rate", "{:.4f}"), ("dp_steps_done", "{:.0f}"),
+                   ("dp_delta", "{:.1e}"), ("achieved_eps", "{:.3f}")]
+    lines = [r"\begin{tabular}{llccccc}", r"\toprule", hdr_dp, r"\midrule"]
+    for ds in datasets:
+        for e in [x for x in EPS_ORDER if x != "nodp"]:
+            s = dp[(dp.dataset == ds) & (dp.eps == e)]
+            if s.empty:
+                continue
+            cells = [(fmt.format(pd.to_numeric(s[k]).mean()) if k in s and s[k].notna().any() else "--")
+                     for k, fmt in cols_dp]
+            lines.append(f"{DATASET_LABELS[ds]} & {e} & " + " & ".join(cells) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}"]
     open(os.path.join(out, "tab_dp.tex"), "w").write("\n".join(lines))
 
@@ -323,10 +383,13 @@ def main():
         p = wilcoxon(d).pvalue
         rep.append(f"{m:12s} n={len(d):3d}  mean diff={d.mean():+.4f}  combined better in "
                    f"{(d < 0).sum() if m in LOWER_BETTER else (d > 0).sum()}/{len(d)}  p={p:.2e}")
+        per_ds = []
         for ds in datasets:
             dd = d.xs(ds, level="dataset") if ds in d.index.get_level_values(0) else pd.Series(dtype=float)
             if len(dd) >= 6 and not (dd == 0).all():
-                rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={wilcoxon(dd).pvalue:.2e}")
+                per_ds.append((ds, dd, wilcoxon(dd).pvalue))
+        for (ds, dd, p_), p_adj in zip(per_ds, holm([x[2] for x in per_ds])):
+            rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={p_:.2e}  p_holm={p_adj:.2e}")
     full_ = ours[ours.config == "combined"].set_index(["dataset", "eps", "seed"])
     abl_cfgs = sorted(c for c in ours.config.unique() if c.startswith("abl:"))
     if abl_cfgs:

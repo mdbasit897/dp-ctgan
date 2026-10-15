@@ -4,6 +4,7 @@ data/*.csv.gz
 data/_kaggle_tmp/
 # experiment outputs
 results/
+results_*/
 output/
 logs/
 *.npz
