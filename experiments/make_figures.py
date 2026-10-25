@@ -23,10 +23,12 @@ the Okabe-Ito colour-blind-safe palette, and a distinct marker / line style for 
 the figures stay readable in greyscale print. Figures are drawn at their printed size
 (6.8 in = ACM text width; 3.3 in = one column), so include them with width=\\textwidth or
 \\columnwidth and the fonts print at 6.5-8 pt. Error bands and bars are 95% t-intervals over seeds, except in
-fig_baselines, which shows mean +- std (the baselines have only 3 seeds, so t-intervals would be very wide).
+fig_baselines, which shows mean +- std (some baselines have only 3 seeds, so t-intervals would be very wide).
+fig_baselines draws one SmartNoise variant (--sn-variant): the matched runs of the review re-run when present.
 
 Seed-level figures use the artefacts of one seed (--seed). A dataset is skipped there, with a message, when
-that run's rare stream is degenerate (the sampler fell back to plain sampling or returned < 100 records), so
+that run's rare stream is degenerate (the judge selected fewer than half of the n_r records, or, in runs
+made before the padding fix, the sampler fell back to plain sampling or returned < 100 records), so
 that a figure never shows a failed run as if it were typical.
 """
 import argparse
@@ -69,6 +71,8 @@ BASELINE_STYLE = {"pategan": dict(color="#009E73", marker="^", ls="-.", label="P
                                      ms=3.2),
                   "sn_patectgan": dict(color="#F0E442", marker="h", ls=(0, (3, 1)), label="PATE-CTGAN (SmartNoise)"),
                   "sn_mst": dict(color="#882255", marker="p", ls=(0, (5, 1, 1, 1)), label="MST (SmartNoise)")}
+# review re-run: SmartNoise with RareSel-DP's delta and public column bounds (same style; one variant per figure)
+BASELINE_STYLE.update({f"{m}_matched": BASELINE_STYLE[m] for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
 EPS_POS = ["1", "3", "10", "nodp"]
 EPS_LBL = {"1": "1", "3": "3", "10": "10", "nodp": "No DP"}
 FULL_W, HALF_W = 6.8, 3.3   # inches (ACM text width ~ 6.8 in, column ~ 3.3 in)
@@ -220,8 +224,15 @@ def fig_privacy_utility(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)"):
     save(fig, out, "fig_privacy_utility")
 
 
-def fig_baselines(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)"):
-    meths = [m for m in BASELINE_STYLE if (df.method == m).any()]
+def fig_baselines(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)", sn_variant="matched"):
+    """sn_variant: which SmartNoise runs to draw, 'matched' (falls back to 'default' when there are none)
+    or 'default' (library defaults, round 2)."""
+    if sn_variant == "matched" and not df.method.astype(str).str.endswith("_matched").any():
+        sn_variant = "default"
+    skip = (lambda m: m.startswith("sn_") and not m.endswith("_matched")) if sn_variant == "matched" \
+        else (lambda m: m.endswith("_matched"))
+    print(f"  fig_baselines: SmartNoise variant = {sn_variant}")
+    meths = [m for m in BASELINE_STYLE if (df.method == m).any() and not skip(m)]
     if not meths:
         print("  (no baseline runs found; skipping fig_baselines)")
         return
@@ -347,12 +358,18 @@ def usable(results, ds, eps, seed, datasets):
     """Datasets selected for seed-level figures whose artefact run has a working rare stream."""
     if ds not in datasets or not art(results, ds, eps, seed, "metrics.json"):
         return False
-    n_rare = json.load(open(art(results, ds, eps, seed, "metrics.json")))["meta"].get("n_rare", 0)
-    ok = n_rare >= 100 and art(results, ds, eps, seed, "sampler_diag.npz") is not None
+    meta = json.load(open(art(results, ds, eps, seed, "metrics.json")))["meta"]
+    n_rare, counts = meta.get("n_rare", 0), meta.get("rare_sampler") or {}
+    if "n_selected" in counts:
+        # runs after the padding fix: n_rare is always n_r; what matters is how many the judge selected
+        ok = counts["n_selected"] >= max(100, 0.5 * n_rare)
+        why = f"judge selected {counts['n_selected']} of {n_rare}, the rest are plain samples"
+    else:
+        ok = n_rare >= 100 and art(results, ds, eps, seed, "sampler_diag.npz") is not None
+        why = f"n_rare={n_rare}{', sampler fell back to plain sampling' if n_rare >= 100 else ''}"
     if not ok and ds not in _SKIPPED:
         _SKIPPED.add(ds)
-        print(f"  skipping {ds} in seed-level figures: eps={eps} seed={seed} has a degenerate rare stream "
-              f"(n_rare={n_rare}{', sampler fell back to plain sampling' if n_rare >= 100 else ''})")
+        print(f"  skipping {ds} in seed-level figures: eps={eps} seed={seed} has a degenerate rare stream ({why})")
     return ok
 
 
@@ -598,6 +615,8 @@ def main():
                     help="datasets in the t-SNE figures (default leaves out MIMIC-III: the panel plots real patients)")
     ap.add_argument("--sampler-fig", action="store_true",
                     help="also draw fig_sampler_scores (flow scores; the ablation shows the flows do not matter)")
+    ap.add_argument("--sn-variant", choices=["matched", "default"], default="matched",
+                    help="SmartNoise baselines in fig_baselines: matched delta/bounds (review re-run) or library defaults")
     a = ap.parse_args()
     out = os.path.join(a.results, "figures")
     os.makedirs(out, exist_ok=True)
@@ -606,7 +625,7 @@ def main():
     if os.path.exists(runs):
         df = pd.read_csv(runs, dtype={"eps": str})
         fig_privacy_utility(df, out)
-        fig_baselines(df, out)
+        fig_baselines(df, out, sn_variant=a.sn_variant)
         fig_gains(df, out)
         fig_ablation(df, out, a.ablation_eps)
     else:

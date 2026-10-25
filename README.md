@@ -1,20 +1,30 @@
-# DP-CTGAN — Differentially-Private Tabular Synthesis with a Rare-Minority Sampler
+# RareSel-DP — Differentially Private Tabular Synthesis with Private Rare-Minority Selection
 
-One pipeline, any dataset. `dp_ctgan_pipeline.py` trains a differentially-private conditional
-CTGAN (Opacus DP-SGD) with a minority-class-aware **rare sampler** (normalizing-flow scoring,
-latent refinement, classifier judge, MaxMin diversity selection, quantile matching), a
-nearest-neighbour **PrivacyGate**, and a full evaluation suite: TSTR utility (RF and k-NN),
-fidelity (KS, JS, correlation difference, discriminator AUC) and privacy (kNN-MIA, DOMIAS-style
-density-ratio attack, LR-MIA, DCR share).
+One pipeline, any dataset. `dp_ctgan_pipeline.py` trains a differentially private conditional
+CTGAN and adds a **rare-minority stream** chosen by a five-stage sampler (normalizing-flow
+scoring, latent refinement, a private classifier judge, MaxMin diversity selection), with a
+full evaluation suite: TSTR utility (RF and k-NN), fidelity (KS, JS, correlation difference,
+discriminator AUC) and privacy (kNN-MIA, DOMIAS-style density-ratio attack, LR-MIA, DCR share).
 
-The `experiments/` folder reproduces every table and figure of the TIST manuscript on four
+**Privacy (the paper's method, `--mode dp`).** Every component that reads training records is
+covered by one (ε, δ) budget: the DP-SGD discriminator (0.8 ε), the minority mean/std released
+with the Gaussian mechanism (0.1 ε) and a DP-SGD MLP judge (0.1 ε), each at δ/3; the sampler is
+post-processing. The GMM mode encoder, the column ranges used for clipping and the training-set
+size are taken from the training data and treated as public, as in the other DP-CTGAN
+implementations. Hyperparameter tuning is **not** included in the reported ε.
+`--mode legacy` is the first experiment round (non-private feature matching, random-forest judge,
+quantile matching); it is kept only to reproduce the round-1 comparison and is not end-to-end DP.
+
+The `experiments/` folder reproduces every table and figure of the manuscript on four
 datasets — Adult Census, Taiwan Credit Default, Credit Card Fraud and MIMIC-III — over
 No-DP, ε = 1, 3, 10 and five seeds.
 
 | Document | Use it for |
 |---|---|
-| `DP-CTGAN_Experiment_Guide.docx` | Step-by-step commands to run everything end to end on the Google Cloud VM, and which output goes where in the manuscript |
-| `RUNNING_EXPERIMENTS.md` | Background: what changed in the code, the evaluation protocol, VM creation, troubleshooting |
+| `ROUND2_DP_RUN.md` | The privatised pipeline (`--mode dp`): what it changes, the main grid, SmartNoise baselines, tables and figures |
+| `REVIEW_RERUN.md` | The re-runs made for the internal review: sampler padding fix, matched SmartNoise baselines, untuned grid |
+| `RUNNING_EXPERIMENTS.md` | Background: evaluation protocol, VM creation, synthcity baselines, troubleshooting (round 1) |
+| `DP-CTGAN_Experiment_Guide.docx` | Round-1 step-by-step guide |
 | this README | Overview, repository layout, quick reference |
 
 ---
@@ -22,7 +32,7 @@ No-DP, ε = 1, 3, 10 and five seeds.
 ## Repository layout
 
 ```
-dp_ctgan_pipeline.py           model, rare sampler, PrivacyGate, metrics, dataset presets (DATASET_PRESETS, HP_PRESETS)
+dp_ctgan_pipeline.py           model, rare sampler, privacy modes, PrivacyGate audit, metrics, dataset presets
 requirements.txt               pinned versions (Python 3.11)
 data/
   prepare_public_datasets.py   downloads Adult, Taiwan (UCI) and Credit Card Fraud (Kaggle, OpenML fallback)
@@ -31,12 +41,13 @@ data/
 experiments/
   common.py                    shared splits (64/8/8/20) and evaluation
   tune.py                      Optuna tuning per dataset and ε -> results/hparams/*.json
-  run_experiments.py           the resumable grid: datasets × ε × seeds (+ ablations)
-  run_baselines.py             synthcity / SmartNoise / SMOTE baselines on identical splits
-  aggregate.py                 LaTeX tables, CSVs, Wilcoxon tests -> results/summary/
-  make_figures.py              all figures (PDF + PNG) -> results/figures/
+  run_experiments.py           the resumable grid: datasets × ε × seeds (+ ablations); --mode dp|legacy
+  run_baselines.py             SmartNoise / synthcity / SMOTE baselines on identical splits (--matched)
+  aggregate.py                 LaTeX tables, CSVs, Wilcoxon tests -> <results>/summary/
+  make_figures.py              all figures (PDF + PNG) -> <results>/figures/
+  check_outputs.py             completeness and consistency check of all inputs and outputs
 gcp/
-  create_vm.sh, setup_vm.sh    create and provision the GPU VM
+  setup_vm.sh                  provision the GPU VM
   run_grid.sh                  launch grid workers in tmux
   sync_results.sh              back results up to a private Cloud Storage bucket
 ```
@@ -46,7 +57,7 @@ gcp/
 ## Reproducing the paper (summary)
 
 Run on the GPU VM, from the repository root, with the Python environment activated.
-The guide (`DP-CTGAN_Experiment_Guide.docx`) explains every step and the expected output.
+`ROUND2_DP_RUN.md` and `REVIEW_RERUN.md` explain every step and the expected output.
 
 ```bash
 # 1. Data
@@ -54,59 +65,56 @@ python3 data/prepare_public_datasets.py                    # adult.csv, UCI_Cred
 gcloud auth application-default login --no-launch-browser  # PhysioNet-linked Google account
 python3 data/prepare_mimic3.py --project YOUR_PROJECT_ID    # mimic3.csv
 
-# 2. Smoke test and timing run
-python3 experiments/run_experiments.py --datasets adult mimic3 --eps 3 --seeds 0 --quick --ablations --out results_smoke
-python3 experiments/run_experiments.py --eps 3 --seeds 0 --ablations --out results_timing
-
-# 3. Tuning (4 datasets in parallel)
+# 2. Tuning (round 1, legacy objective; the dp grid reuses these settings, see the paper's appendix)
 mkdir -p logs
 for ds in adult taiwan_credit credit_fraud mimic3; do
   PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4 LOKY_MAX_CPU_COUNT=4 \
     python3 experiments/tune.py --datasets $ds --trials 20 > logs/tune_$ds.log 2>&1 &
 done; wait
 
-# 4. Full grid: 4 datasets × {No-DP, 1, 3, 10} × 5 seeds = 80 runs (3 workers)
-for i in 0 1 2; do
-  PYTHONUNBUFFERED=1 OMP_NUM_THREADS=5 LOKY_MAX_CPU_COUNT=5 \
-    python3 experiments/run_experiments.py --shard $i/3 --ablations > logs/worker_$i.log 2>&1 &
+# 3. Main grid, privatised pipeline: 4 datasets × {No-DP, 1, 3, 10} × 5 seeds = 80 runs (4 workers)
+for i in 0 1 2 3; do
+  nohup env PYTHONUNBUFFERED=1 OMP_NUM_THREADS=5 LOKY_MAX_CPU_COUNT=5 \
+    python3 experiments/run_experiments.py --mode dp --shard $i/4 --ablations \
+      --hp-dir results/hparams --out results_dp > logs/dp_worker_$i.log 2>&1 &
 done; wait
+# untuned robustness grid (dataset presets, no ablations)
+#   ... run_experiments.py --mode dp --shard $i/4 --hp-dir none --out results_dp_untuned
 
-# 5. Baselines on the same splits: 3 seeds; CTGAN / TVAE / DP-GAN trained for 300 epochs (--n-iter)
-python3 experiments/run_baselines.py --methods pategan dpgan aim --eps 1 3 10 --seeds 0 1 2
-python3 experiments/run_baselines.py --methods ctgan tvae --eps none --seeds 0 1 2
+# 4. Baselines on the same splits (SmartNoise in its own environment, see ROUND2_DP_RUN.md §5.2)
+.venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan sn_patectgan sn_mst --matched --seeds 0 1 2 3 4
 python3 experiments/run_baselines.py --methods smote --eps none
-python3 experiments/check_outputs.py          # verifies datasets, tuning, grid, artifacts, baselines, tables
 
-# 6. Tables and figures
-python3 experiments/aggregate.py --results results --ablation-eps 3
-python3 experiments/make_figures.py --results results --fig-eps 3
+# 5. Tables, figures, checks
+python3 experiments/aggregate.py --results results_dp --baselines-dir results/baselines --legacy-results results --ablation-eps 3
+python3 experiments/make_figures.py --results results_dp --fig-eps 3
+python3 experiments/check_outputs.py --results results_dp --baselines-dir results/baselines
 ```
 
 Every run writes its own `metrics.json` and finished runs are skipped, so any step can be
 restarted after a Spot preemption or a crash by rerunning the same command.
 
-### Outputs
+### Outputs (in `results_dp/summary/` and `results_dp/figures/`)
 
-| File | Manuscript |
+| File | Content |
 |---|---|
-| `results/summary/tab_utility.tex` | Table *utility* (TSTR, mean ± std over 5 seeds) |
-| `results/summary/tab_fidelity_privacy.tex` | Table *fidelity* (KS, JS, corr., disc. AUC, MIAs, DCR) |
-| `results/summary/tab_ablation.tex` | Table *ablation* |
-| `results/summary/tab_baselines.tex` | Baseline comparison |
-| `results/summary/tab_gate.tex` | PrivacyGate keep / near-copy / outlier rates |
-| `results/summary/tab_dp.tex` | δ, σ, q, T and achieved ε |
-| `results/summary/tab_confusion.tex` | Appendix confusion matrices |
-| `results/summary/stats.txt` | Wilcoxon tests, combined vs common |
-| `results/summary/runs.csv`, `mean_std.csv` | All numbers, per run and aggregated |
-| `results/figures/fig_*.pdf` | All figures (privacy–utility, ours vs baselines, gains, ablation, MIA ROC, sampler scores, PR curves, marginals, t-SNE, correlation differences); drawn at print size (6.8 in = `\textwidth`), error bands = 95% CI over seeds |
+| `tab_utility.tex` | TSTR utility: TRTR, common stream, combined (mean ± std over 5 seeds) |
+| `tab_fidelity_privacy.tex` | KS, JS, correlation difference, MIAs, DCR |
+| `tab_ablation.tex` | sampler ablation (every variant adds the same number of minority records) |
+| `tab_baselines.tex`, `tab_baseline_minority.tex` | baseline comparison and the baselines' synthetic minority rates |
+| `tab_budget.tex`, `tab_dp.tex` | ε per component, basic and RDP totals; DP-SGD accounting of the discriminator |
+| `tab_gate.tex`, `tab_confusion.tex`, `tab_dp_vs_legacy.tex` | PrivacyGate audit, confusion matrices, private vs round-1 pipeline |
+| `stats.txt` | Wilcoxon tests: all runs, DP runs only, without the tuning seed, seed-level; ablations; padded rare streams |
+| `runs.csv`, `mean_std.csv` | all numbers, per run and aggregated |
+| `figures/fig_*.pdf` | all figures, drawn at print size (6.8 in = `\textwidth`) |
 
 ### Evaluation protocol (per seed, stratified)
 
 - Splits: 20% sealed test; of the remaining 80%: 10% membership holdout, 10% validation,
   80% GAN training (64% of all records).
-- F1 threshold chosen on the validation split. RF (200 trees, balanced) and k-NN (k = 5).
-- δ = min(10⁻⁵, 1/(10·n_train)). Hyperparameter tuning on the private data is **not**
-  included in the reported ε.
+- F1 threshold chosen on the (real) validation split. RF (200 trees, balanced) and k-NN (k = 5).
+- δ = min(10⁻⁵, 1/(10·n_train)), split δ/3 per private component. Hyperparameter tuning on the
+  private data is **not** included in the reported ε.
 
 ---
 
@@ -115,7 +123,8 @@ restarted after a Spot preemption or a crash by rerunning the same command.
 ```bash
 pip install -r requirements.txt
 
-# Point it at any CSV — categorical columns are auto-detected
+# Point it at any CSV — categorical columns are auto-detected (privatised pipeline by default;
+# add --mode legacy for the round-1 pipeline)
 python3 dp_ctgan_pipeline.py --data yourfile.csv --target your_label_column --epsilon 3
 
 # Or use a built-in preset
@@ -147,8 +156,8 @@ defaults are in `HP_PRESETS`.
 | Stays the same across datasets | You configure per dataset |
 |---|---|
 | DPCTGAN engine (GAN + Opacus DP-SGD) | file path, target column |
-| StableNVP rare-class flow sampler | categorical / log1p / int columns |
-| PrivacyGate near-copy/outlier filter | numeric hard bounds |
+| StableNVP rare-class flow sampler + private judge | categorical / log1p / int columns |
+| PrivacyGate near-copy/outlier audit | numeric hard bounds |
 | kNN-MIA / DOMIAS / LR-MIA / DCR evaluation | ε budget, GAN hyperparameters |
 | TSTR RF/k-NN evaluation | custom cleaning hook (optional) |
 

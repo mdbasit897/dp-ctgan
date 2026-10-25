@@ -67,11 +67,15 @@ def quick_overrides(hp):
     return hp
 
 
-def make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp, flags, use_qm, diag=False):
+def sampler_counts(d):
+    """How many rare records the judge actually selected and how many were padded with plain samples."""
+    return {k: int(d[k][0]) for k in ("n_survivors", "n_selected", "n_padded") if d is not None and len(d.get(k, []))}
+
+
+def make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp, flags, use_qm):
     train = splits["train"]
     real_min = train[train[target] == 1].reset_index(drop=True)
-    res = model.sample_rare(n_rare, df_real=train, hp=hp, return_diagnostics=diag, **flags)
-    rare, d = res if diag else (res, None)
+    rare, d = model.sample_rare(n_rare, df_real=train, hp=hp, return_diagnostics=True, **flags)
     if use_qm and hp.quantile_blend > 0:
         rare = P.quantile_match(rare, real_min, cont_cols, blend=hp.quantile_blend, orig_df=train)
     rare[target] = 1
@@ -94,11 +98,13 @@ def run_one(dataset, eps, seed, args):
     splits = make_splits(df, target, seed)
     train = splits["train"]
 
-    overrides = {}
+    overrides, hp_source = {}, "preset"
     hp_file = os.path.join(args.hp_dir, f"{dataset}_eps{eps_tag(eps)}.json")
-    if os.path.exists(hp_file):
-        overrides = json.load(open(hp_file))["best_params"]
+    if args.hp_dir.lower() != "none" and os.path.exists(hp_file):
+        overrides, hp_source = json.load(open(hp_file))["best_params"], hp_file
         print(f"  using tuned hyperparameters from {hp_file}: {overrides}")
+    else:
+        print("  using the dataset preset hyperparameters (no tuned file)")
     hp = P.apply_privacy_mode(P.hyperparams_for(dataset, overrides), args.mode)
     if args.judge:
         hp.judge_type = args.judge
@@ -112,8 +118,8 @@ def run_one(dataset, eps, seed, args):
         "dataset": dataset, "epsilon": eps, "seed": seed, "n_total": len(df),
         "n_train": len(train), "n_val": len(splits["val"]), "n_holdout": len(splits["holdout"]),
         "n_test": len(splits["test"]), "minority_rate_test": float(splits["test"][target].mean()),
-        "n_features": len(feat), "n_categorical": len(cat_cols), "hp": asdict(hp), "quick": args.quick,
-        "mode": args.mode}}
+        "n_features": len(feat), "n_categorical": len(cat_cols), "hp": asdict(hp), "hp_source": hp_source,
+        "quick": args.quick, "mode": args.mode}}
     save_art = seed == args.artifact_seed
 
     t = time.time()
@@ -147,10 +153,12 @@ def run_one(dataset, eps, seed, args):
     n_rare = max(200, int(n_min * hp.rare_multiplier))
     t = time.time()
     rare, gate["rare"], diag = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
-                                         {}, True, diag=True)
+                                         {}, True)
     timings["sample_rare"] = time.time() - t
     combined = pd.concat([common, rare], ignore_index=True)[df.columns]
     R["meta"]["n_rare"] = int(len(rare))
+    R["meta"]["rare_sampler"] = sampler_counts(diag)
+    print(f"  rare stream: {R['meta']['rare_sampler']}")
     R["privacy_gate"] = gate
 
     probs = {"y_test": splits["test"][target].values.astype(np.int8),
@@ -173,7 +181,7 @@ def run_one(dataset, eps, seed, args):
         if hp.privacy_filter_enabled:
             plain = P.privacy_realism_filter(plain, train[train[target] == 1], feat, desired_n=n_rare,
                                              max_ref=hp.privacy_max_ref, verbose=False)
-        variants = {"plain_oversample": plain}
+        variants, counts = {"plain_oversample": plain}, {}
         judges = {}
         for name, (flags, use_qm) in (ABLATIONS_DP if args.mode == "dp" else ABLATIONS).items():
             flags = dict(flags)
@@ -181,13 +189,14 @@ def run_one(dataset, eps, seed, args):
                 flags["judge"] = judges.setdefault("disc", P.DiscJudge(model))
             elif flags.get("judge") == "rf_nonprivate":
                 flags["judge"] = judges.setdefault("rf", P.RFJudge(target, feat).fit(train))
-            variants[name], _, _ = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
-                                             flags, use_qm)
+            variants[name], _, d_v = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
+                                               flags, use_qm)
+            counts[name] = sampler_counts(d_v)
         for name, rv in variants.items():
             comb_v = pd.concat([common, rv], ignore_index=True)[df.columns]
             R["ablations"][name] = {"utility": tstr(comb_v, splits, scaler, feat, target, hp.knn_k, seed),
                                     "fidelity": dict(zip(("ks", "js"), P.compute_ks_js(train, comb_v, feat))),
-                                    "n_rare": int(len(rv))}
+                                    "n_rare": int(len(rv)), **counts.get(name, {})}
         timings["ablations"] = time.time() - t
 
     timings["total"] = time.time() - t_all
@@ -218,7 +227,8 @@ def main():
     ap.add_argument("--quick", action="store_true", help="tiny settings for a smoke test")
     ap.add_argument("--shard", default="0/1", help="i/N: run every N-th job starting at i")
     ap.add_argument("--data-dir", default=None, help="directory with the prepared CSVs (default: ./data)")
-    ap.add_argument("--hp-dir", default="results/hparams", help="tuned hyperparameters from tune.py")
+    ap.add_argument("--hp-dir", default="results/hparams",
+                    help="tuned hyperparameters from tune.py; 'none' = dataset presets (untuned grid)")
     ap.add_argument("--mode", choices=["dp", "legacy"], default="dp",
                     help="dp (default): privatised pipeline; legacy: first experiment round")
     ap.add_argument("--judge", choices=["mlp", "disc", "rf"], default=None,

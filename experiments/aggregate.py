@@ -35,7 +35,10 @@ EPS_ORDER = ["nodp", "10", "3", "1"]
 BASELINE_NAMES = {"sn_dpctgan": "DP-CTGAN (SmartNoise)", "sn_patectgan": "PATE-CTGAN (SmartNoise)",
                   "sn_mst": "MST (SmartNoise)", "ctgan": r"CTGAN$^\dagger$", "tvae": r"TVAE$^\dagger$",
                   "smote": r"SMOTE$^\dagger$", "pategan": "PATE-GAN", "dpgan": "DP-GAN", "aim": "AIM"}
-BASELINE_ORDER = ["sn_dpctgan", "sn_patectgan", "sn_mst", "pategan", "dpgan", "aim", "ctgan", "tvae", "smote"]
+BASELINE_NAMES.update({f"{m}_matched": BASELINE_NAMES[m].replace("(SmartNoise)", "(SmartNoise, matched)")
+                       for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
+BASELINE_ORDER = ["sn_dpctgan_matched", "sn_patectgan_matched", "sn_mst_matched", "sn_dpctgan", "sn_patectgan",
+                  "sn_mst", "pategan", "dpgan", "aim", "ctgan", "tvae", "smote"]
 EPS_TEX = {"nodp": "No-DP", "10": r"$\varepsilon=10$", "3": r"$\varepsilon=3$", "1": r"$\varepsilon=1$",
            "5": r"$\varepsilon=5$"}
 
@@ -75,22 +78,35 @@ def collect(res, baselines_dir=None):
         m = R["meta"]
         base = {"method": "ours", "dataset": m["dataset"], "eps": eps_key(m["epsilon"]), "seed": m["seed"],
                 "achieved_eps": m.get("achieved_epsilon"), "mode": m.get("mode", "legacy"),
+                "hp_source": m.get("hp_source"),
                 **{f"dp_{k}": v for k, v in (m.get("dp") or {}).items()},
                 **{f"budget_{k}": v for k, v in (m.get("dp_budget") or {}).items()},
                 "total_min": R.get("timings_sec", {}).get("total", np.nan) / 60}
         rows.append({**base, "config": "trtr", **flat({"utility": R["trtr"]})})
-        for c in ("common", "combined"):
-            rows.append({**base, "config": c, **flat(R[c])})
+        rare_counts = lambda blk: {f"rare_{k}": blk.get(k) for k in ("n_rare", "n_survivors", "n_selected",
+                                                                       "n_padded") if blk.get(k) is not None}
+        rows.append({**base, "config": "common", **flat(R["common"])})
+        # n_selected / n_padded: rare records chosen by the judge vs plain samples added to reach n_r
+        rows.append({**base, "config": "combined", **flat(R["combined"]),
+                     **rare_counts({"n_rare": m.get("n_rare"), **(m.get("rare_sampler") or {})})})
         for name, blk in R.get("ablations", {}).items():
-            rows.append({**base, "config": f"abl:{name}", **flat(blk)})
+            rows.append({**base, "config": f"abl:{name}", **flat(blk), **rare_counts(blk)})
         for s, st in (R.get("privacy_gate") or {}).items():
             if st:
                 rows.append({**base, "config": f"gate:{s}", **{f"gate_{k}": v for k, v in st.items()}})
     for f in glob.glob(os.path.join(baselines_dir, "*", "*", "eps*", "seed*", "metrics.json")):
         R = json.load(open(f))
         m = R["meta"]
+        sn, delta_used = m.get("smartnoise") or {}, m.get("delta")
+        if str(m.get("plugin", "")).startswith("sn_") and not sn:
+            # round-2 SmartNoise runs (library defaults) stored RareSel-DP's delta = 1/(10 n_train), which was
+            # not passed to the library; recover n_train from it and report the library's own delta
+            n_tr = 1.0 / (10.0 * float(m["delta"]))
+            delta_used = 1e-9 if m["plugin"] == "sn_mst" else 1.0 / (n_tr * np.sqrt(n_tr))
+            sn = {"preprocessor_eps": 0.1 * float(m["epsilon"])}
         rows.append({"method": m["method"], "config": m["method"], "dataset": m["dataset"],
-                     "eps": eps_key(m["epsilon"]), "seed": m["seed"],
+                     "eps": eps_key(m["epsilon"]), "seed": m["seed"], "delta_used": delta_used,
+                     "sn_preprocessor_eps": sn.get("preprocessor_eps"),
                      "minority_rate_synth": m.get("minority_rate_synth"), **flat(R)})
     return pd.DataFrame(rows)
 
@@ -238,7 +254,9 @@ def main():
             df, keys, ["rf_auc", "rf_auprc", "rf_f1", "ks", "domias_auc", "dcr_share"],
             r"Dataset & Setting & RF AUC & RF AUPRC & RF F1 & KS & DOMIAS AUC & DCR share",
             "Comparison with baselines on identical splits and evaluation (mean $\\pm$ std over seeds; seeds per "
-            f"setting: {seeds_txt}). SmartNoise generators use their default settings. "
+            f"setting: {seeds_txt}). (SmartNoise): library defaults, i.e.\\ the library's delta and 10\\% of "
+            "$\\varepsilon$ spent on private column bounds; (SmartNoise, matched): the same delta and public column "
+            "bounds as ours, the full $\\varepsilon$ for the generator. "
             r"$^\dagger$Not differentially private (listed under No-DP); SMOTE interpolates real training records "
             "and is a utility reference, not a private release.", "tab:baselines"))
         # synthetic minority rate (class balance of each generator's output)
@@ -390,6 +408,45 @@ def main():
                 per_ds.append((ds, dd, wilcoxon(dd).pvalue))
         for (ds, dd, p_), p_adj in zip(per_ds, holm([x[2] for x in per_ds])):
             rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={p_:.2e}  p_holm={p_adj:.2e}")
+
+    # primary test on the DP runs only (No-DP excluded); robustness: without seed 0 (the tuning seed) and
+    # with seeds as units (runs with the same seed share a split, so they are not independent)
+    def wil(d, label):
+        d = d.dropna()
+        if len(d) >= 6 and not (d == 0).all():
+            rep.append(f"  {label:38s} n={len(d):3d} mean diff={d.mean():+.4f} combined better in "
+                       f"{int((d > 0).sum())}/{len(d)}  p={wilcoxon(d).pvalue:.2e}")
+    rep += ["", "DP runs only (eps in {1, 3, 10}), combined - common"]
+    for m in ["rf_auprc", "knn_auprc", "rf_auc"]:
+        if m not in a_:
+            continue
+        d = pd.to_numeric(a_.loc[common_idx, m]) - pd.to_numeric(b_.loc[common_idx, m])
+        dp = d[d.index.get_level_values("eps") != "nodp"]
+        seed_lvl = dp.groupby(level=["dataset", "seed"]).mean()
+        rep.append(f"[{m}]")
+        wil(dp, "all DP runs")
+        wil(dp[dp.index.get_level_values("seed") != 0], "DP runs, seeds 1-4 (tuning seed left out)")
+        wil(seed_lvl, "dataset-seed units (mean over budgets)")
+        per_ds = [(ds, dp.xs(ds, level="dataset")) for ds in datasets if ds in dp.index.get_level_values(0)]
+        per_ds = [(ds, dd, wilcoxon(dd).pvalue) for ds, dd in per_ds if len(dd) >= 6 and not (dd == 0).all()]
+        for (ds, dd, p_), p_adj in zip(per_ds, holm([x[2] for x in per_ds])):
+            sl = seed_lvl.xs(ds, level="dataset")
+            rep.append(f"    {ds:14s} n={len(dd):2d} mean diff={dd.mean():+.4f} p={p_:.2e}  p_holm={p_adj:.2e}  "
+                       f"seeds with a positive mean gain: {int((sl > 0).sum())}/{len(sl)}")
+
+    # rare streams that the judge could not fill (completed with plain G(z, c_min) samples)
+    if "rare_n_padded" in ours:
+        rep += ["", "Rare streams completed with plain samples (judge accepted fewer than n_r candidates)"]
+        for cfg in ["combined"] + sorted(c for c in ours.config.unique() if c.startswith("abl:")):
+            x = ours[ours.config == cfg]
+            pad = pd.to_numeric(x.get("rare_n_padded"), errors="coerce")
+            if pad.notna().sum() == 0:
+                continue
+            rep.append(f"  {cfg:28s} padded in {int((pad > 0).sum())}/{int(pad.notna().sum())} runs")
+            if cfg == "combined":
+                for _, r in x[pad > 0].sort_values(["dataset", "eps", "seed"]).iterrows():
+                    rep.append(f"      {r.dataset} eps={r.eps} seed={r.seed}: judge-selected {int(r.rare_n_selected)}, "
+                               f"padded {int(r.rare_n_padded)} of {int(r.rare_n_rare)}")
     full_ = ours[ours.config == "combined"].set_index(["dataset", "eps", "seed"])
     abl_cfgs = sorted(c for c in ours.config.unique() if c.startswith("abl:"))
     if abl_cfgs:

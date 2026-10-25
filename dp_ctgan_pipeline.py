@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """
-DP-CTGAN (RareFlow-DP) — Differentially-Private Tabular Synthesis Pipeline
+RareSel-DP — differentially private tabular synthesis with private rare-minority selection
 
 One shared engine for every dataset:
   * ModeNormalizer (GMM mode-specific encoding)
   * Conditional generator + discriminator; the discriminator is trained with
     DP-SGD (Opacus, RDP accountant) when an epsilon is given
-  * Minority-aware generator objective: adversarial + feature matching (FM)
-    + minority moment matching (MM) + minority correlation matching (corr)
-    + minority feature matching (MFM), followed by minority fine-tuning
+  * Minority-aware generator objective: adversarial + minority moment matching (MM)
+    (+ feature / correlation / minority feature matching in legacy mode only),
+    followed by minority fine-tuning
   * Rare-minority sampler in the generator's hidden space:
       Stage 1 pool generation -> Stage 2 StableNVP likelihood-ratio scoring
-      -> Stage 3 latent refinement -> Stage 4 RF judge -> Stage 5 greedy
-      MaxMin diversity -> Stage 6 partial quantile matching (applied by caller)
-  * PrivacyGate near-copy / outlier filter
+      -> Stage 3 latent refinement -> Stage 4 judge -> Stage 5 greedy MaxMin
+      diversity (-> Stage 6 partial quantile matching, legacy mode only)
+  * PrivacyGate near-copy / outlier audit
   * kNN-MIA / LR-MIA evaluation
 
-PRIVACY SCOPE: epsilon bounds the discriminator's DP-SGD updates only. The
-generator's FM/MM/corr/MFM losses, fine-tuning, the encoder, the RF judge,
-quantile matching and the PrivacyGate read real data outside the accountant,
-so the released data is NOT end-to-end (epsilon, delta)-DP. See the
-"Privacy Scope" section of the manuscript.
+PRIVACY MODES (apply_privacy_mode):
+  dp      (the method in the paper) every component that reads training records is
+          covered by epsilon: DP-SGD discriminator (0.8 eps), Gaussian-mechanism minority
+          mean/std (0.1 eps) and a DP-SGD MLP judge (0.1 eps), each at delta/3; the sampler
+          is post-processing. NOT covered: the GMM mode encoder and the column ranges used
+          for clipping, which are fitted on the training data and treated as public, and the
+          training-set size n used to set delta and the sampling rates.
+  legacy  the first experiment round: feature/correlation matching on real batches, exact
+          minority moments, non-private random-forest judge, quantile matching and
+          PrivacyGate filtering; epsilon then bounds the discriminator only, so the released
+          data are NOT end-to-end (epsilon, delta)-DP.
 
 Quick use:
-    python dp_ctgan_pipeline.py --preset adult --epsilon 3
+    python dp_ctgan_pipeline.py --preset adult --epsilon 3            # dp mode (default)
     python dp_ctgan_pipeline.py --data yourfile.csv --target label --epsilon none
 For the full multi-seed experiment grid used in the paper see
-experiments/run_experiments.py and RUNNING_EXPERIMENTS.md.
+experiments/run_experiments.py, ROUND2_DP_RUN.md and REVIEW_RERUN.md.
 """
 
 import os, sys, warnings, time, math, argparse, json, copy
@@ -1446,6 +1452,8 @@ class DPCTGAN:
                     use_judge=True, use_maxmin=True, return_diagnostics=False, judge=None):
         """Stages 1-5 of the rare-minority sampler (Stage 6, quantile matching, is applied
         by the caller). The use_* flags switch stages off for the ablation study.
+        Always returns n records: if fewer than n candidates pass the judge within rare_max_iters
+        rounds, the rest are plain minority-conditioned samples (diagnostics: n_selected, n_padded).
         judge: the Stage-4 judge to use. If None and use_judge, the model's own judge is used
         (dp mode), or a non-private random forest is trained on df_real (legacy mode)."""
         hp = hp or self.hp
@@ -1501,22 +1509,30 @@ class DPCTGAN:
                 continue
             all_raw.append(raw[mask]); all_h.append(h_sc[mask]); all_score.append(score[top_idx][mask])
 
-        if not all_raw:
-            df_fb = self.sample_minority_plain(n)
-            return (df_fb, {}) if return_diagnostics else df_fb
-
-        raw_all, h_all, s_all = np.concatenate(all_raw), np.concatenate(all_h), np.concatenate(all_score)
-        k_sel = min(n, len(raw_all))
-        # Stage 5 — diversity selection
-        if use_maxmin:
-            sel = greedy_maxmin_pca(h_all, k=k_sel, scores=s_all)
-        elif use_flow:
-            sel = np.argsort(-s_all)[:k_sel]
-        else:
-            sel = rng.choice(len(raw_all), k_sel, replace=False)
-        df_sel = self._decode(raw_all[sel])
+        df_sel, n_survivors = None, sum(len(r) for r in all_raw)
+        if all_raw:
+            raw_all, h_all, s_all = np.concatenate(all_raw), np.concatenate(all_h), np.concatenate(all_score)
+            k_sel = min(n, len(raw_all))
+            # Stage 5 — diversity selection
+            if use_maxmin:
+                sel = greedy_maxmin_pca(h_all, k=k_sel, scores=s_all)
+            elif use_flow:
+                sel = np.argsort(-s_all)[:k_sel]
+            else:
+                sel = rng.choice(len(raw_all), k_sel, replace=False)
+            df_sel = self._decode(raw_all[sel])
+            diag["selected_score"] = [s_all[sel]]
+        # fewer than n survivors after rare_max_iters: complete the stream with plain G(z, c_min)
+        # samples (post-processing), so every variant always adds exactly n minority records
+        n_selected = 0 if df_sel is None else len(df_sel)
+        n_pad = n - n_selected
+        if n_pad > 0:
+            pad = self.sample_minority_plain(n_pad).drop(columns=[self._target_col])
+            df_sel = pad if df_sel is None else pd.concat([df_sel, pad], ignore_index=True)
         df_sel[self._target_col] = 1
-        diag["selected_score"] = [s_all[sel]]
+        diag["n_survivors"] = [np.array([n_survivors])]
+        diag["n_selected"] = [np.array([n_selected])]
+        diag["n_padded"] = [np.array([max(n_pad, 0)])]
         diag = {k: (np.concatenate(v) if v else np.array([])) for k, v in diag.items()}
         return (df_sel, diag) if return_diagnostics else df_sel
 
@@ -1689,7 +1705,7 @@ def main():
     p.add_argument("--trials", type=int, default=8)
     p.add_argument("--gan-epochs", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", choices=["legacy", "dp"], default="legacy",
+    p.add_argument("--mode", choices=["legacy", "dp"], default="dp",
                    help="'dp': every component that reads real data is covered by epsilon (see apply_privacy_mode)")
     p.add_argument("--out", type=str, default="output")
     args = p.parse_args()

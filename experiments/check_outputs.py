@@ -4,6 +4,7 @@
   python3 experiments/check_outputs.py                       # from the repository root
   python3 experiments/check_outputs.py --baseline-seeds 5    # if the baselines use all 5 seeds
   python3 experiments/check_outputs.py --results results_dp --baselines-dir results/baselines   # dp round
+  python3 experiments/check_outputs.py --results results_dp_untuned --hp-dir none            # untuned grid
 
 Checks: prepared datasets, tuned hyperparameters, the 80-run grid (completeness, tuned settings
 actually used, achieved epsilon, ablations, PrivacyGate), the seed-0 artifacts the figures need,
@@ -32,12 +33,16 @@ FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", 
           [f"fig_{k}_{d}" for k in ("marginals", "embedding", "corrdiff") for d in DATASETS]
 # synthcity PATE-GAN / DP-GAN and AIM were dropped (degenerate or infeasible runs; kept in results/_excluded)
 BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "sn_dpctgan": ["1", "3", "10"],
-             "sn_patectgan": ["1", "3", "10"], "sn_mst": ["1", "3", "10"]}
+             "sn_patectgan": ["1", "3", "10"], "sn_mst": ["1", "3", "10"],
+             # review re-run: RareSel-DP's delta, public column bounds, no preprocessing budget, 5 seeds
+             "sn_dpctgan_matched": ["1", "3", "10"], "sn_patectgan_matched": ["1", "3", "10"],
+             "sn_mst_matched": ["1", "3", "10"]}
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--baseline-seeds", type=int, default=3, help="number of seeds the baselines are run with")
 ap.add_argument("--results", default="results", help="results folder of the main grid (results_dp for dp mode)")
-ap.add_argument("--hp-dir", default="results/hparams")
+ap.add_argument("--hp-dir", default="results/hparams", help="'none' for the untuned grid (dataset presets)")
+ap.add_argument("--matched-seeds", type=int, default=5, help="seeds of the matched SmartNoise baselines (sn_*_matched)")
 ap.add_argument("--baselines-dir", default=None, help="default: <results>/baselines")
 _a = ap.parse_args()
 BL_SEEDS, RES, HPD = _a.baseline_seeds, _a.results, _a.hp_dir
@@ -66,10 +71,13 @@ hp = {}
 for d in DATASETS:
     for e in EPS:
         p = f"{HPD}/{d}_eps{e}.json"
-        if os.path.exists(p):
+        if HPD.lower() != "none" and os.path.exists(p):
             hp[(d, e)] = json.load(open(p))["best_params"]
 missing = [f"{d}_eps{e}" for d in DATASETS for e in EPS if (d, e) not in hp]
-ok(not missing, "16/16 files", f"missing tuned settings: {missing}")
+if HPD.lower() == "none":
+    print("  untuned grid: every run should use the dataset presets")
+else:
+    ok(not missing, "16/16 files", f"missing tuned settings: {missing}")
 
 section(f"3. Main grid ({RES}/<dataset>/eps<e>/seed<s>/metrics.json)")
 runs, bad_runs = {}, []
@@ -90,12 +98,19 @@ for d in DATASETS:
     n = sum(1 for k in runs if k[0] == d)
     print(f"         {d:14s} {n}/20")
 
-untuned, quick, no_abl, no_gate, eps_over = [], [], [], [], []
+untuned, quick, no_abl, no_gate, eps_over, padded, unfixed = [], [], [], [], [], [], []
 for (d, e, s), R in runs.items():
     tag = f"{d}/eps{e}/seed{s}"
     m = R["meta"]
     if m.get("quick"):
         quick.append(tag)
+    if HPD.lower() == "none" and m.get("hp_source", "preset") != "preset":
+        untuned.append(tag)
+    rs = m.get("rare_sampler") or {}
+    if rs.get("n_padded"):
+        padded.append(f"{tag} (judge selected {rs.get('n_selected')} of {m.get('n_rare')})")
+    if m.get("mode") == "dp" and d == "credit_fraud" and e in ("1", "3") and "n_selected" not in rs:
+        unfixed.append(tag)
     for k, v in hp.get((d, e), {}).items():
         got = m["hp"].get(k)
         if got is None or (isinstance(v, (int, float)) and not np.isclose(float(got), float(v))) or \
@@ -113,8 +128,16 @@ for (d, e, s), R in runs.items():
             bad_runs.append(f"{tag}: no '{key}' block")
 ok(not bad_runs, "every run has TRTR, common and combined results", f"incomplete runs: {bad_runs}")
 ok(not quick, "no smoke-test (--quick) runs mixed in", f"--quick runs in results/: {quick}")
-ok(not untuned, "every run used its tuned hyperparameters", f"runs NOT using tuned settings: {untuned}")
-ok(not no_abl, "all ablation variants in every run", f"runs missing ablations: {no_abl}")
+ok(not untuned, "every run used its " + ("preset" if HPD.lower() == "none" else "tuned") + " hyperparameters",
+   f"runs NOT using the intended settings: {untuned}")
+ok(not unfixed, "Credit Card Fraud eps 1/3 re-run with the padding fix (sampler counts recorded)",
+   f"re-run with the padding fix still to do (REVIEW_RERUN.md, Step A): {unfixed}", warn=True)
+print(f"  [info] rare stream completed with plain samples in {len(padded)} run(s)" +
+      "".join(f"\n           {x}" for x in padded))
+if HPD.lower() == "none":
+    print("  [info] untuned grid: run without ablations (not checked)")
+else:
+    ok(not no_abl, "all ablation variants in every run", f"runs missing ablations: {no_abl}")
 ok(not no_gate, "PrivacyGate statistics in every run", f"runs missing PrivacyGate stats: {no_gate}", warn=True)
 ok(not eps_over, "achieved epsilon <= target in every DP run", f"achieved epsilon above target: {eps_over}")
 
@@ -126,8 +149,9 @@ ok(not miss, f"all {len(DATASETS) * len(EPS) * len(ARTIFACTS)} artifact files pr
 
 section(f"5. Baselines ({BLD}/)")
 for meth, eps_l in BASELINES.items():
-    want = len(DATASETS) * len(eps_l) * BL_SEEDS
-    files = [f for s in range(BL_SEEDS) for f in glob.glob(f"{BLD}/{meth}/*/eps*/seed{s}/metrics.json")]
+    n_seeds = _a.matched_seeds if meth.endswith("_matched") else BL_SEEDS
+    want = len(DATASETS) * len(eps_l) * n_seeds
+    files = [f for s in range(n_seeds) for f in glob.glob(f"{BLD}/{meth}/*/eps*/seed{s}/metrics.json")]
     errs = glob.glob(f"{BLD}/{meth}/*/eps*/seed*/error.txt")
     ok(len(files) == want and not errs, f"{meth:8s} {len(files)}/{want}",
        f"{meth:8s} {len(files)}/{want} done, {len(errs)} errors" + (f" (e.g. {errs[0]})" if errs else ""), warn=True)
