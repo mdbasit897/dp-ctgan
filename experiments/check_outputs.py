@@ -3,7 +3,7 @@
 
   python3 experiments/check_outputs.py                       # from the repository root
   python3 experiments/check_outputs.py --baseline-seeds 5    # if the baselines use all 5 seeds
-  python3 experiments/check_outputs.py --results results_dp --baselines-dir results/baselines   # dp round
+  python3 experiments/check_outputs.py --results results_dp --baselines-dir results/baselines   # RareSel-DP grid
   python3 experiments/check_outputs.py --results results_dp_untuned --hp-dir none            # untuned grid
 
 Checks: prepared datasets, tuned hyperparameters, the 80-run grid (completeness, tuned settings
@@ -31,10 +31,10 @@ TABLES = ["tab_utility.tex", "tab_fidelity_privacy.tex", "tab_ablation.tex", "ta
 FIGURES = ["fig_privacy_utility", "fig_gains", "fig_ablation", "fig_pr_curves", "fig_mia_roc_domias", "fig_sampler_scores",
            "fig_baselines", "fig_embedding_all"] + \
           [f"fig_{k}_{d}" for k in ("marginals", "embedding", "corrdiff") for d in DATASETS]
-# synthcity PATE-GAN / DP-GAN and AIM were dropped (degenerate or infeasible runs; kept in results/_excluded)
+# AIM (synthcity) is not part of the comparison: infeasible or too slow on three datasets (see the paper's appendix)
 BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "sn_dpctgan": ["1", "3", "10"],
              "sn_patectgan": ["1", "3", "10"], "sn_mst": ["1", "3", "10"],
-             # review re-run: RareSel-DP's delta, public column bounds, no preprocessing budget, 5 seeds
+             # matched: RareSel-DP's delta, public column bounds, no preprocessing budget, 5 seeds
              "sn_dpctgan_matched": ["1", "3", "10"], "sn_patectgan_matched": ["1", "3", "10"],
              "sn_mst_matched": ["1", "3", "10"]}
 
@@ -130,8 +130,8 @@ ok(not bad_runs, "every run has TRTR, common and combined results", f"incomplete
 ok(not quick, "no smoke-test (--quick) runs mixed in", f"--quick runs in results/: {quick}")
 ok(not untuned, "every run used its " + ("preset" if HPD.lower() == "none" else "tuned") + " hyperparameters",
    f"runs NOT using the intended settings: {untuned}")
-ok(not unfixed, "Credit Card Fraud eps 1/3 re-run with the padding fix (sampler counts recorded)",
-   f"re-run with the padding fix still to do (REVIEW_RERUN.md, Step A): {unfixed}", warn=True)
+ok(not unfixed, "rare-sampler counts recorded (Credit Card Fraud, eps 1/3)",
+   f"runs without rare-sampler counts (n_selected / n_padded): {unfixed}", warn=True)
 print(f"  [info] rare stream completed with plain samples in {len(padded)} run(s)" +
       "".join(f"\n           {x}" for x in padded))
 if HPD.lower() == "none":

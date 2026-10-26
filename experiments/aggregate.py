@@ -15,10 +15,10 @@ Outputs (results/summary/):
   stats.txt                Wilcoxon signed-rank tests, combined vs common (per-dataset p-values also
                            Holm-adjusted over the four datasets), and every ablation vs full
   tab_budget.tex           dp mode: epsilon per component, total (basic and RDP), moment noise, judge noise
-  tab_dp_vs_legacy.tex     with --legacy-results: privatised vs first-round pipeline (RF AUPRC)
+  tab_nonprivate.tex       with --nonprivate-results: non-private variant vs RareSel-DP (RF AUPRC)
 
   python experiments/aggregate.py --results results
-  python experiments/aggregate.py --results results_dp --baselines-dir results/baselines --legacy-results results
+  python experiments/aggregate.py --results results_dp --baselines-dir results/baselines --nonprivate-results results
 """
 import argparse
 import glob
@@ -77,7 +77,7 @@ def collect(res, baselines_dir=None):
         R = json.load(open(f))
         m = R["meta"]
         base = {"method": "ours", "dataset": m["dataset"], "eps": eps_key(m["epsilon"]), "seed": m["seed"],
-                "achieved_eps": m.get("achieved_epsilon"), "mode": m.get("mode", "legacy"),
+                "achieved_eps": m.get("achieved_epsilon"), "mode": m.get("mode", ""),
                 "hp_source": m.get("hp_source"),
                 **{f"dp_{k}": v for k, v in (m.get("dp") or {}).items()},
                 **{f"budget_{k}": v for k, v in (m.get("dp_budget") or {}).items()},
@@ -99,8 +99,8 @@ def collect(res, baselines_dir=None):
         m = R["meta"]
         sn, delta_used = m.get("smartnoise") or {}, m.get("delta")
         if str(m.get("plugin", "")).startswith("sn_") and not sn:
-            # round-2 SmartNoise runs (library defaults) stored RareSel-DP's delta = 1/(10 n_train), which was
-            # not passed to the library; recover n_train from it and report the library's own delta
+            # SmartNoise runs with library defaults (no "smartnoise" metadata) store RareSel-DP's delta =
+            # 1/(10 n_train), which is not passed to the library; recover n_train and report the library's own delta
             n_tr = 1.0 / (10.0 * float(m["delta"]))
             delta_used = 1e-9 if m["plugin"] == "sn_mst" else 1.0 / (n_tr * np.sqrt(n_tr))
             sn = {"preprocessor_eps": 0.1 * float(m["epsilon"])}
@@ -175,8 +175,8 @@ def main():
     ap.add_argument("--results", default="results")
     ap.add_argument("--ablation-eps", default="3")
     ap.add_argument("--baselines-dir", default=None, help="default: <results>/baselines")
-    ap.add_argument("--legacy-results", default=None,
-                    help="first-round results folder; adds tab_dp_vs_legacy.tex")
+    ap.add_argument("--nonprivate-results", default=None,
+                    help="results folder of the non-private variant (run_experiments.py --mode nonprivate); adds tab_nonprivate.tex")
     a = ap.parse_args()
     out = os.path.join(a.results, "summary")
     os.makedirs(out, exist_ok=True)
@@ -276,7 +276,7 @@ def main():
     # PrivacyGate and DP accounting
     dp_mode = (df[df.method == "ours"]["mode"] == "dp").any() if "mode" in df else False
     cap = (r"\caption{PrivacyGate audit: fraction of synthetic records that the gate flags as near-copies of training "
-           r"records or as outliers (mean over seeds). In the privatised pipeline the gate only audits; no record is "
+           r"records or as outliers (mean over seeds). In RareSel-DP the gate only audits; no record is "
            r"removed.}" if dp_mode else
            r"\caption{PrivacyGate statistics (fraction of candidate records kept, removed as near-copies, removed as "
            r"outliers; mean over seeds).}")
@@ -302,7 +302,7 @@ def main():
     open(os.path.join(out, "tab_gate.tex"), "w").write("\n".join(lines))
 
     # DP-SGD accounting of the discriminator. dp mode: delta and epsilon of the discriminator's share of the
-    # budget (the totals over all components are in tab_budget.tex); legacy mode: the discriminator is the whole budget.
+    # budget (the totals over all components are in tab_budget.tex); nonprivate mode: the discriminator is the whole budget.
     dp = df[(df.method == "ours") & (df.config == "combined") & (df.eps != "nodp")]
     if dp_mode:
         hdr_dp = (r"Dataset & Target $\varepsilon$ & $\sigma$ & $q$ & $T$ & $\delta_{\mathrm{GAN}}$ & "
@@ -363,14 +363,14 @@ def main():
         lines += [r"\bottomrule", r"\end{tabular}"]
         open(os.path.join(out, "tab_budget.tex"), "w").write("\n".join(lines))
 
-    # privatised vs first-round pipeline
-    if a.legacy_results:
-        leg = collect(a.legacy_results, os.path.join(a.legacy_results, "_none_"))
+    # non-private variant vs RareSel-DP
+    if a.nonprivate_results:
+        leg = collect(a.nonprivate_results, os.path.join(a.nonprivate_results, "_none_"))
         leg = leg[leg.method == "ours"]
         ours_ = df[df.method == "ours"]
         lines = [r"\begin{tabular}{llcccccc}", r"\toprule",
-                 r" & & \multicolumn{3}{c}{First round (non-private components)} & "
-                 r"\multicolumn{3}{c}{Privatised pipeline} \\",
+                 r" & & \multicolumn{3}{c}{Non-private variant (upper reference)} & "
+                 r"\multicolumn{3}{c}{RareSel-DP} \\",
                  r"\cmidrule(lr){3-5}\cmidrule(lr){6-8}",
                  r"Dataset & $\varepsilon$ & Common & Combined & Gain & Common & Combined & Gain \\", r"\midrule"]
         for ds in datasets:
@@ -383,7 +383,7 @@ def main():
                 lines.append(f"{DATASET_LABELS[ds]} & {EPS_TEX.get(e, e)} & {ms(lc)} & {ms(lb)} & {gain(lb, lc)} & "
                              f"{ms(pc)} & {ms(pb)} & {gain(pb, pc)} \\\\")
         lines += [r"\bottomrule", r"\end{tabular}"]
-        open(os.path.join(out, "tab_dp_vs_legacy.tex"), "w").write("\n".join(lines))
+        open(os.path.join(out, "tab_nonprivate.tex"), "w").write("\n".join(lines))
 
     # significance: combined vs common, paired over (dataset, eps, seed)
     ours = df[df.method == "ours"]

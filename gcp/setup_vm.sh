@@ -3,7 +3,7 @@
 #   bash setup_vm.sh            # first run installs the driver and reboots
 #   bash setup_vm.sh            # run again after the reboot to finish
 set -euo pipefail
-REPO_URL="${REPO_URL:-https://github.com/YOUR_USER/dp-ctgan.git}"   # or copy the folder with gcloud compute scp
+REPO_URL="${REPO_URL:-https://github.com/mdbasit897/dp-ctgan.git}"   # or copy the folder with gcloud compute scp
 REPO_DIR="$HOME/dp-ctgan"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -22,15 +22,15 @@ if [[ ! -d "$REPO_DIR" ]]; then
   git clone "$REPO_URL" "$REPO_DIR"
 fi
 cd "$REPO_DIR"
-# uv provides the same Python 3.11 the pipeline was tested with (Ubuntu 22.04 ships 3.10)
+# uv provides the Python 3.12 used for the experiments (Ubuntu 22.04 ships 3.10)
 if ! command -v uv >/dev/null 2>&1; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
   export PATH="$HOME/.local/bin:$PATH"
 fi
-uv venv --python 3.11 .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt       # PyPI torch wheels already include the CUDA 12 runtime
-uv pip install google-cloud-bigquery db-dtypes pyarrow kaggle imbalanced-learn
+uv pip install google-cloud-bigquery db-dtypes pyarrow kaggle
 python - <<'PY'
 import torch, opacus, sklearn
 print("torch", torch.__version__, "cuda available:", torch.cuda.is_available(),

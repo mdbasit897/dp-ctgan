@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Run baseline generators on exactly the same splits and evaluation as run_experiments.py.
 
-Methods (install the libraries in SEPARATE virtual environments, see RUNNING_EXPERIMENTS.md):
+Methods (install the libraries in SEPARATE virtual environments, see README.md):
   synthcity : pategan, dpgan, aim, privbayes (DP);  ctgan, tvae (non-private references)
   smartnoise: sn_dpctgan, sn_patectgan, sn_mst (DP)
   imblearn  : smote (non-private oversampling of the real training data; utility reference only)
 
 Writes results/baselines/<method>/<dataset>/eps<e>/seed<s>/metrics.json.
 
-  python experiments/run_baselines.py --methods pategan dpgan aim ctgan tvae --eps 1 3 10
+  python experiments/run_baselines.py --methods ctgan tvae --eps none --seeds 0 1 2
   python experiments/run_baselines.py --methods smote --eps none
 
-SmartNoise settings. Default (round 2, "library defaults"): the library infers the continuous column
+SmartNoise settings. Default ("library defaults"): the library infers the continuous column
 bounds privately with preprocessor_eps = 0.1 eps (subtracted from the training budget) and uses its own
 delta (1/(n sqrt(n)) for DP-CTGAN and PATE-CTGAN, 1e-9 for MST). With --matched the baselines get the
 same treatment as RareSel-DP: delta = min(1e-5, 1/(10 n_train)) and the training-range column bounds
@@ -66,7 +66,7 @@ def sn_library_delta(name, n_train):
 
 
 def gen_smartnoise(name, train, target, cat_cols, eps, n, delta=None, public_bounds=False):
-    """delta=None and public_bounds=False reproduce the round-2 runs (library defaults)."""
+    """delta=None and public_bounds=False give the library defaults."""
     from snsynth import Synthesizer
     cont = [c for c in train.columns if c not in cat_cols + [target]]
     kw = {} if delta is None else {"delta": float(delta)}
@@ -122,8 +122,7 @@ def run_one(method, ds, eps, seed, args):
     synth = P.postprocess_synthetic(synth, tr, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
 
     scaler = StandardScaler().fit(P._ensure_numeric(tr, target)[feat].values.astype(float))
-    # the delta actually used by the generator (round 2 stored RareSel-DP's delta here for SmartNoise runs,
-    # although it was not passed to the library)
+    # the delta actually used by the generator (with library defaults, SmartNoise uses its own delta)
     if method.startswith("sn_"):
         sn = {"matched": bool(args.matched), "public_bounds": bool(args.matched),
               "preprocessor_eps": 0.0 if args.matched else SN_DEFAULT_PREPROCESSOR_FRAC * float(eps)}
@@ -154,7 +153,7 @@ def main():
     ap.add_argument("--n-iter", type=int, default=300,
                     help="training epochs for ctgan / tvae / dpgan (0 = synthcity default)")
     ap.add_argument("--plugin-kwargs", type=json.loads, default=None,
-                    help='extra synthcity plugin arguments as JSON, e.g. \'{"lamda": 0.01}\' (see probe_pategan.py)')
+                    help='extra synthcity plugin arguments as JSON, e.g. \'{"lamda": 0.01}\'')
     ap.add_argument("--name", default=None,
                     help="folder/label for the results (default: the method name); one method per call")
     ap.add_argument("--matched", action="store_true",

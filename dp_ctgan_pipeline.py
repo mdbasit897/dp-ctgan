@@ -7,12 +7,12 @@ One shared engine for every dataset:
   * Conditional generator + discriminator; the discriminator is trained with
     DP-SGD (Opacus, RDP accountant) when an epsilon is given
   * Minority-aware generator objective: adversarial + minority moment matching (MM)
-    (+ feature / correlation / minority feature matching in legacy mode only),
+    (+ feature / correlation / minority feature matching in nonprivate mode only),
     followed by minority fine-tuning
   * Rare-minority sampler in the generator's hidden space:
       Stage 1 pool generation -> Stage 2 StableNVP likelihood-ratio scoring
       -> Stage 3 latent refinement -> Stage 4 judge -> Stage 5 greedy MaxMin
-      diversity (-> Stage 6 partial quantile matching, legacy mode only)
+      diversity (-> Stage 6 partial quantile matching, nonprivate mode only)
   * PrivacyGate near-copy / outlier audit
   * kNN-MIA / LR-MIA evaluation
 
@@ -23,16 +23,16 @@ PRIVACY MODES (apply_privacy_mode):
           is post-processing. NOT covered: the GMM mode encoder and the column ranges used
           for clipping, which are fitted on the training data and treated as public, and the
           training-set size n used to set delta and the sampling rates.
-  legacy  the first experiment round: feature/correlation matching on real batches, exact
-          minority moments, non-private random-forest judge, quantile matching and
-          PrivacyGate filtering; epsilon then bounds the discriminator only, so the released
-          data are NOT end-to-end (epsilon, delta)-DP.
+  nonprivate  the non-private variant used as an upper reference and as the tuning proxy:
+          feature/correlation matching on real batches, exact minority moments, non-private
+          random-forest judge, quantile matching and PrivacyGate filtering; epsilon then bounds
+          the discriminator only, so the released data are NOT (epsilon, delta)-DP.
 
 Quick use:
     python dp_ctgan_pipeline.py --preset adult --epsilon 3            # dp mode (default)
     python dp_ctgan_pipeline.py --data yourfile.csv --target label --epsilon none
 For the full multi-seed experiment grid used in the paper see
-experiments/run_experiments.py, ROUND2_DP_RUN.md and REVIEW_RERUN.md.
+experiments/run_experiments.py and README.md.
 """
 
 import os, sys, warnings, time, math, argparse, json, copy
@@ -157,10 +157,10 @@ class Hyperparams:
     knn_k: int = 5
     test_split: float = 0.20
     final_mia_holdout_frac: float = 0.10
-    # privacy mode (see apply_privacy_mode): "legacy" = first experiment round (real-data
+    # privacy mode (see apply_privacy_mode): "nonprivate" = non-private variant (real-data
     # statistics, RF judge and quantile matching outside the accountant); "dp" = every
     # component that reads real data is covered by the DP budget, except the GMM encoder
-    privacy_mode: str = "legacy"
+    privacy_mode: str = "nonprivate"
     budget_frac_judge: float = 0.10          # share of epsilon for the DP-SGD judge (judge_type="mlp")
     budget_frac_stats: float = 0.10          # share of epsilon for the minority mean/std (Gaussian mechanism)
     judge_type: str = "rf"                   # "rf" (non-private), "mlp" (DP-SGD in dp mode), "disc" (DP discriminator)
@@ -175,7 +175,7 @@ class Hyperparams:
 def apply_privacy_mode(hp: "Hyperparams", mode: str) -> "Hyperparams":
     """Configure the components that read real data.
 
-    legacy: the first experiment round, unchanged.
+    nonprivate: the non-private variant (upper reference and tuning proxy).
     dp:     the generator sees real data only through the DP discriminator and through
             minority mean/std released with the Gaussian mechanism; no feature matching,
             correlation matching or quantile matching; the judge is a DP-SGD classifier;
@@ -189,7 +189,7 @@ def apply_privacy_mode(hp: "Hyperparams", mode: str) -> "Hyperparams":
         hp.quantile_blend = 0.0
         hp.privacy_filter_enabled = False
         hp.judge_type = "mlp"
-    elif mode != "legacy":
+    elif mode != "nonprivate":
         raise ValueError(f"unknown privacy mode {mode!r}")
     return hp
 
@@ -488,7 +488,7 @@ rdp_total_epsilon = rdp_epsilon
 def minority_statistics(min_np, cont_idx, n_cont_cols, n_cat_cols, epsilon=None, delta=None, rng=None):
     """Per-coordinate mean and std of the encoded minority records.
 
-    epsilon=None: exact statistics (as in the first experiment round).
+    epsilon=None: exact statistics (nonprivate mode).
     epsilon given: one Gaussian mechanism on the vector of sums
         [sum_i x_i (all encoded coordinates), sum_i a_i^2 (continuous scalars), c * count].
     Every encoded record has bounded norm by construction (continuous scalars are clipped to
@@ -968,7 +968,7 @@ def _train_flow(flow, data_tensor, epochs, lr, device):
 #  score(raw, decoded) takes the generator output (encoded space) and its decoded frame.
 
 class RFJudge:
-    """Random forest on the real training data (first experiment round). NOT private."""
+    """Random forest on the real training data (nonprivate mode). NOT private."""
     kind, private, has_prob = "rf", False, True
 
     def __init__(self, target_col, feat_cols):
@@ -1086,7 +1086,7 @@ class DPCTGAN:
         self.flow_min = self.flow_maj = None
         self._minority_rate = 0.0
         self._actual_epsilon = float('inf')
-        self.epsilon_total = float('inf')     # all components (basic composition); = _actual_epsilon in legacy mode
+        self.epsilon_total = float('inf')     # all components (basic composition); = _actual_epsilon in nonprivate mode
         self.dp_info = {}
         self.budget = {}
         self.judge = None
@@ -1182,7 +1182,7 @@ class DPCTGAN:
             if dp_mode:
                 D, opt_D, loader = make_private_dp(pe, D, opt_D, loader, self.eps_gan, self.delta_gan,
                                                    self.epochs, self.max_grad_norm)
-            else:   # first experiment round, unchanged
+            else:   # nonprivate mode: epsilon for the discriminator only
                 D, opt_D, loader = pe.make_private_with_epsilon(
                     module=D, optimizer=opt_D, data_loader=loader,
                     target_epsilon=self.eps_gan, target_delta=self.delta_gan,
@@ -1198,7 +1198,7 @@ class DPCTGAN:
         eps_of = (lambda d: rdp_epsilon(pe, d)) if dp_mode else (lambda d: pe.get_epsilon(d))
 
         self._G, self._D, self._raw_D = G, D, raw_D
-        need_real = hp.lambda_fm > 0 or hp.lambda_mfm > 0   # generator losses on real batches (legacy only)
+        need_real = hp.lambda_fm > 0 or hp.lambda_mfm > 0   # generator losses on real batches (nonprivate mode only)
         dp_tag = f"eps={self.epsilon}" if self.use_dp else "No-DP"
         if self.verbose:
             extra = f" sigma={self.dp_info['noise_multiplier']:.3f}" if self.use_dp else ""
@@ -1212,16 +1212,26 @@ class DPCTGAN:
             G.train(); D.train()
             for xb, yb in loader:
                 bs_d = xb.size(0)
-                if bs_d < 2:
+                if bs_d < 2 and not (self.use_dp and dp_mode):
                     continue
                 xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 cond_d = self._onehot(yb)
+                if self.use_dp and dp_mode:
+                    # The generated half has a fixed size and conditions drawn at the released minority
+                    # rate, independently of which real records the Poisson sampler drew, so adding or
+                    # removing one training record changes the clipped gradient sum by at most C.
+                    n_f = bs_loader
+                    cond_f = self._onehot((torch.rand(n_f, device=DEVICE) < self._minority_rate).long())
+                else:
+                    n_f, cond_f = bs_d, cond_d
                 with torch.no_grad():
-                    fake_d = G(torch.randn(bs_d, self.latent_dim, device=DEVICE), cond_d)
+                    fake_d = G(torch.randn(n_f, self.latent_dim, device=DEVICE), cond_f)
                 if self.use_dp or self.r1_gamma <= 0:
-                    both = D(torch.cat([torch.cat([xb, cond_d], 1), torch.cat([fake_d, cond_d], 1)], 0))
-                    loss_D = (bce(both[:bs_d], torch.full((bs_d, 1), 0.9, device=DEVICE))
-                              + bce(both[bs_d:], torch.zeros(bs_d, 1, device=DEVICE))) * 0.5
+                    both = D(torch.cat([torch.cat([xb, cond_d], 1), torch.cat([fake_d, cond_f], 1)], 0))
+                    loss_fake = bce(both[bs_d:], torch.zeros(n_f, 1, device=DEVICE))
+                    loss_real = (bce(both[:bs_d], torch.full((bs_d, 1), 0.9, device=DEVICE)) if bs_d > 0
+                                 else loss_fake * 0.0)
+                    loss_D = (loss_real + loss_fake) * 0.5
                 else:
                     real_gp = xb.clone().detach().requires_grad_(True)
                     d_real = D(torch.cat([real_gp, cond_d], 1))
@@ -1234,7 +1244,7 @@ class DPCTGAN:
                 steps_done += 1
 
                 # ---- generator step ----
-                # legacy: the matching losses read a real (class-balanced) batch outside the DP
+                # nonprivate mode: the matching losses read a real (class-balanced) batch outside the DP
                 # accountant. dp mode: no real batch; conditions are drawn with a fixed public rate.
                 bs = self.batch_size
                 zero = torch.zeros((), device=DEVICE)
@@ -1303,7 +1313,7 @@ class DPCTGAN:
         for p in G.parameters():
             p.requires_grad_(False)
 
-        # ---- judge for Stage 4 (dp mode; legacy mode builds its RF inside sample_rare) ----
+        # ---- judge for Stage 4 (dp mode; nonprivate mode builds its RF inside sample_rare) ----
         if dp_mode:
             if hp.judge_type == "mlp":
                 eps_j = self.epsilon * f_judge if self.use_dp else None
@@ -1455,7 +1465,7 @@ class DPCTGAN:
         Always returns n records: if fewer than n candidates pass the judge within rare_max_iters
         rounds, the rest are plain minority-conditioned samples (diagnostics: n_selected, n_padded).
         judge: the Stage-4 judge to use. If None and use_judge, the model's own judge is used
-        (dp mode), or a non-private random forest is trained on df_real (legacy mode)."""
+        (dp mode), or a non-private random forest is trained on df_real (nonprivate mode)."""
         hp = hp or self.hp
         assert (self.flow_min is not None) or not use_flow, "call build_flows() first"
         rng = np.random.RandomState(int(torch.randint(0, 2**31 - 1, (1,)).item()))
@@ -1705,7 +1715,7 @@ def main():
     p.add_argument("--trials", type=int, default=8)
     p.add_argument("--gan-epochs", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", choices=["legacy", "dp"], default="dp",
+    p.add_argument("--mode", choices=["nonprivate", "dp"], default="dp",
                    help="'dp': every component that reads real data is covered by epsilon (see apply_privacy_mode)")
     p.add_argument("--out", type=str, default="output")
     args = p.parse_args()

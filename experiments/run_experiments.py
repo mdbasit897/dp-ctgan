@@ -11,7 +11,9 @@ Two privacy modes (see dp_ctgan_pipeline.apply_privacy_mode):
                  DP discriminator + Gaussian-mechanism minority mean/std + DP-SGD judge;
                  no feature/correlation/quantile matching; PrivacyGate audit only.
                  Writes to results_dp/ unless --out is given.
-  --mode legacy  the first experiment round (writes to results/).
+  --mode nonprivate  the non-private variant reported as an upper reference: real-data
+                 statistics, feature/correlation matching, random-forest judge and quantile
+                 matching outside the accountant (writes to results/).
 
 Examples
   # smoke test (minutes, tiny settings)
@@ -35,7 +37,7 @@ from sklearn.preprocessing import StandardScaler
 from common import (DATASETS, P, eps_tag, fidelity, load, make_splits, parse_eps, privacy, tstr)
 
 ABLATIONS = {
-    # name: (sample_rare flags, apply quantile matching)   -- legacy mode
+    # name: (sample_rare flags, apply quantile matching)   -- nonprivate mode
     "no_qm": (dict(), False),
     "no_flow_refine": (dict(use_flow=False, use_refine=False), True),
     "no_refine": (dict(use_refine=False), True),
@@ -49,7 +51,7 @@ ABLATIONS_DP = {
     "no_judge": (dict(use_judge=False), False),
     "no_maxmin": (dict(use_maxmin=False), False),
     "judge_disc": (dict(judge="disc"), False),                  # DP discriminator as judge, no extra budget
-    "judge_rf_nonprivate": (dict(judge="rf_nonprivate"), False),  # first-round RF judge (NOT private), reference
+    "judge_rf_nonprivate": (dict(judge="rf_nonprivate"), False),  # RF judge on real data (NOT private), reference
 }
 
 
@@ -229,11 +231,11 @@ def main():
     ap.add_argument("--data-dir", default=None, help="directory with the prepared CSVs (default: ./data)")
     ap.add_argument("--hp-dir", default="results/hparams",
                     help="tuned hyperparameters from tune.py; 'none' = dataset presets (untuned grid)")
-    ap.add_argument("--mode", choices=["dp", "legacy"], default="dp",
-                    help="dp (default): privatised pipeline; legacy: first experiment round")
+    ap.add_argument("--mode", choices=["dp", "nonprivate"], default="dp",
+                    help="dp (default): RareSel-DP; nonprivate: the non-private variant (upper reference)")
     ap.add_argument("--judge", choices=["mlp", "disc", "rf"], default=None,
                     help="override the Stage-4 judge of the main (combined) stream")
-    ap.add_argument("--out", default=None, help="default: results_dp (dp mode) or results (legacy)")
+    ap.add_argument("--out", default=None, help="default: results_dp (dp mode) or results (nonprivate mode)")
     ap.add_argument("--delta", type=float, default=None)
     ap.add_argument("--artifact-seed", type=int, default=0, help="seed whose synthetic data/scores are saved for figures")
     args = ap.parse_args()

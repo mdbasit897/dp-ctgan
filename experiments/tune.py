@@ -5,8 +5,9 @@ Uses only the seed-0 GAN training split (inner 85/15 train / tuning-MIA holdout)
 validation split, never the test split or the final MIA holdout. Writes
 results/hparams/<dataset>_eps<e>.json, which run_experiments.py picks up automatically.
 
-NOTE: tuning on private data consumes privacy budget that is NOT included in the reported
-epsilon (Papernot & Steinke, ICLR 2022). State this in the paper.
+The paper's hyperparameters were selected in --mode nonprivate (the non-private proxy
+configuration described in the appendix) and reused for RareSel-DP. Tuning on private data
+consumes privacy budget that is NOT included in the reported epsilon (Papernot & Steinke, ICLR 2022).
 
   python experiments/tune.py --datasets adult taiwan_credit --eps none 3 10 --trials 20
 """
@@ -28,8 +29,8 @@ def main():
     ap.add_argument("--eps", nargs="+", default=["none", "1", "3", "10"])
     ap.add_argument("--trials", type=int, default=20)
     ap.add_argument("--data-dir", default=None)
-    ap.add_argument("--out", default=None, help="default: results/hparams (legacy) or results_dp/hparams (dp)")
-    ap.add_argument("--mode", choices=["legacy", "dp"], default="legacy",
+    ap.add_argument("--out", default=None, help="default: results/hparams (nonprivate) or results_dp/hparams (dp)")
+    ap.add_argument("--mode", choices=["nonprivate", "dp"], default="nonprivate",
                     help="privacy mode the GAN is tuned in (run_experiments.py reads --hp-dir)")
     ap.add_argument("--quick", action="store_true")
     args = ap.parse_args()

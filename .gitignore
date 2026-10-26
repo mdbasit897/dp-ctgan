@@ -7,11 +7,15 @@ results/
 results_*/
 output/
 logs/
+paper_tables/
 *.npz
-# environments
+# environments and editor files
 .venv/
+.venv-sn/
 venv*/
 __pycache__/
 *.pyc
+.idea/
+.~lock*
 # synthcity metric cache
 workspace/

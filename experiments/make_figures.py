@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Publication figures from the experiment results (vector PDF + PNG preview).
 
-  python experiments/make_figures.py --results results --fig-eps 3
-  python experiments/make_figures.py --results results_dp --fig-eps 3        # round 2 (dp mode)
+  python experiments/make_figures.py --results results_dp --fig-eps 3        # RareSel-DP (figures of the paper)
+  python experiments/make_figures.py --results results --fig-eps 3           # non-private variant
 
 Figures (results/figures/):
   fig_privacy_utility.pdf   RF AUPRC vs privacy budget, common vs combined, real-data reference
@@ -24,7 +24,7 @@ the figures stay readable in greyscale print. Figures are drawn at their printed
 (6.8 in = ACM text width; 3.3 in = one column), so include them with width=\\textwidth or
 \\columnwidth and the fonts print at 6.5-8 pt. Error bands and bars are 95% t-intervals over seeds, except in
 fig_baselines, which shows mean +- std (some baselines have only 3 seeds, so t-intervals would be very wide).
-fig_baselines draws one SmartNoise variant (--sn-variant): the matched runs of the review re-run when present.
+fig_baselines draws one SmartNoise variant (--sn-variant): the matched runs (same delta and public bounds) when present.
 
 Seed-level figures use the artefacts of one seed (--seed). A dataset is skipped there, with a message, when
 that run's rare stream is degenerate (the judge selected fewer than half of the n_r records, or, in runs
@@ -71,7 +71,7 @@ BASELINE_STYLE = {"pategan": dict(color="#009E73", marker="^", ls="-.", label="P
                                      ms=3.2),
                   "sn_patectgan": dict(color="#F0E442", marker="h", ls=(0, (3, 1)), label="PATE-CTGAN (SmartNoise)"),
                   "sn_mst": dict(color="#882255", marker="p", ls=(0, (5, 1, 1, 1)), label="MST (SmartNoise)")}
-# review re-run: SmartNoise with RareSel-DP's delta and public column bounds (same style; one variant per figure)
+# matched SmartNoise runs: RareSel-DP's delta and public column bounds (same style; one variant per figure)
 BASELINE_STYLE.update({f"{m}_matched": BASELINE_STYLE[m] for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
 EPS_POS = ["1", "3", "10", "nodp"]
 EPS_LBL = {"1": "1", "3": "3", "10": "10", "nodp": "No DP"}
@@ -226,7 +226,7 @@ def fig_privacy_utility(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)"):
 
 def fig_baselines(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)", sn_variant="matched"):
     """sn_variant: which SmartNoise runs to draw, 'matched' (falls back to 'default' when there are none)
-    or 'default' (library defaults, round 2)."""
+    or 'default' (library defaults)."""
     if sn_variant == "matched" and not df.method.astype(str).str.endswith("_matched").any():
         sn_variant = "default"
     skip = (lambda m: m.startswith("sn_") and not m.endswith("_matched")) if sn_variant == "matched" \
@@ -616,7 +616,7 @@ def main():
     ap.add_argument("--sampler-fig", action="store_true",
                     help="also draw fig_sampler_scores (flow scores; the ablation shows the flows do not matter)")
     ap.add_argument("--sn-variant", choices=["matched", "default"], default="matched",
-                    help="SmartNoise baselines in fig_baselines: matched delta/bounds (review re-run) or library defaults")
+                    help="SmartNoise baselines in fig_baselines: matched delta/bounds or library defaults")
     a = ap.parse_args()
     out = os.path.join(a.results, "figures")
     os.makedirs(out, exist_ok=True)

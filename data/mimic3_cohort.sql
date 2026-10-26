@@ -1,11 +1,11 @@
 -- ============================================================================
--- MIMIC-III cohort for DP-CTGAN / RareFlow-DP (BigQuery Standard SQL)
+-- MIMIC-III cohort for RareSel-DP (BigQuery Standard SQL)
 --
 -- One row per hospital admission of an adult (>= 18 y) with at least one ICU stay.
 -- Target: MORTALITY = in-hospital death (admissions.hospital_expire_flag).
 -- Vital signs are aggregated over the FIRST 24 HOURS of the FIRST ICU stay of the
 -- admission, so they are available at prediction time (no post-outcome leakage).
--- To aggregate over the whole stay instead (closer to some earlier scripts), change
+-- To aggregate over the whole stay instead, change
 -- the window in `vitals` below — and say so in the paper.
 --
 -- Requires PhysioNet credentialed access to the `physionet-data` BigQuery project.
