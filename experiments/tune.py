@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tune GAN hyperparameters with Optuna for each (dataset, epsilon) on seed 0.
+"""EARLIER PROTOCOL. Tune GAN hyperparameters with Optuna for each (dataset, epsilon) on seed 0.
+The end-to-end protocol uses tune_lodo.py instead (selection without the target dataset).
 
 Uses only the seed-0 GAN training split (inner 85/15 train / tuning-MIA holdout) and the
 validation split, never the test split or the final MIA holdout. Writes

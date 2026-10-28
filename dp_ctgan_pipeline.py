@@ -18,11 +18,17 @@ One shared engine for every dataset:
 
 PRIVACY MODES (apply_privacy_mode):
   dp      (the method in the paper) every component that reads training records is
-          covered by epsilon: DP-SGD discriminator (0.8 eps), Gaussian-mechanism minority
-          mean/std (0.1 eps) and a DP-SGD MLP judge (0.1 eps), each at delta/3; the sampler
-          is post-processing. NOT covered: the GMM mode encoder and the column ranges used
-          for clipping, which are fitted on the training data and treated as public, and the
-          training-set size n used to set delta and the sampling rates.
+          covered by epsilon. With the private encoder (hp.encoder = "dp", the end-to-end
+          protocol of experiments/run_experiments.py) the budget is split four ways, each at
+          delta/4: the column encoder and column ranges (0.05 eps; Gaussian-mechanism
+          histograms, see dp_column_summaries), the DP-SGD discriminator (0.75 eps),
+          Gaussian-mechanism minority mean/std (0.1 eps) and a DP-SGD MLP judge (0.1 eps).
+          The schema (columns, category domains, documented column bounds) comes from
+          DatasetConfig and is never computed from the records; the training-set size n is
+          treated as public. The sampler and all clipping are post-processing.
+          With hp.encoder = "data" (the earlier protocol, kept as an ablation) the GMM encoder
+          and the column ranges are fitted on the training data and are NOT covered; the
+          budget is then split 0.8 / 0.1 / 0.1 at delta/3.
   nonprivate  the non-private variant used as an upper reference and as the tuning proxy:
           feature/correlation matching on real batches, exact minority moments, non-private
           random-forest judge, quantile matching and PrivacyGate filtering; epsilon then bounds
@@ -104,10 +110,15 @@ class DatasetConfig:
     positive_labels: List[str] = field(default_factory=lambda: ["1", "1.0", "true", "yes", ">50k"])
     id_cols: List[str] = field(default_factory=list)       # dropped unconditionally (IDs, free text, leakage)
     cat_cols: Optional[List[str]] = None                   # None = auto-infer
+    # public schema (end-to-end protocol): the category domain of every categorical column, from the
+    # dataset documentation, and documented bounds of continuous columns in raw units. Continuous columns
+    # without a public bound get a private range (dp_column_summaries). Neither is computed from the records.
+    cat_domains: Optional[Dict[str, List[str]]] = None
+    public_bounds: Dict[str, tuple] = field(default_factory=dict)
     log1p_cols: List[str] = field(default_factory=list)    # log(1+x) after clipping at 0
     signed_log1p_cols: List[str] = field(default_factory=list)  # sign(x)*log(1+|x|) (keeps negative values)
     int_cols: List[str] = field(default_factory=list)      # rounded after synthesis (raw-scale columns only)
-    hard_bounds: Dict[str, tuple] = field(default_factory=dict)
+    hard_bounds: Dict[str, tuple] = field(default_factory=dict)   # earlier protocol only (encoder = "data")
     max_rows: Optional[int] = None                         # subsample majority so len(df)=max_rows; keeps all minority rows
     drop_high_corr_threshold: Optional[float] = 0.95
     custom_clean_fn: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
@@ -170,6 +181,12 @@ class Hyperparams:
     judge_max_grad_norm: float = 1.0
     mm_noise_ref: float = 0.1                # moment matching is down-weighted when noise/n exceeds this
     finetune_min_mm_weight: float = 0.5      # skip minority fine-tuning when the noisy moments are this unreliable
+    # column encoder: "data" = GMMs, category counts and ranges fitted on the training data (outside the
+    # budget); "dp" = fitted from the public schema and Gaussian-mechanism histograms (dp_column_summaries)
+    encoder: str = "data"
+    budget_frac_encoder: float = 0.05        # share of epsilon for the private encoder (encoder="dp", dp mode)
+    encoder_bins: int = 64                   # equal-width histogram bins per continuous column (stage 2)
+    encoder_range_frac: float = 0.3          # share of the encoder budget for the private ranges (stage 1)
 
 
 def apply_privacy_mode(hp: "Hyperparams", mode: str) -> "Hyperparams":
@@ -196,6 +213,64 @@ def apply_privacy_mode(hp: "Hyperparams", mode: str) -> "Hyperparams":
 
 DATA_DIR = os.environ.get("DPCTGAN_DATA_DIR", "data")
 
+# Public category domains. Adult: the value lists of adult.names (UCI). Taiwan: the codes of the dataset
+# description (SEX 1-2; EDUCATION 1-6; MARRIAGE 1-3; PAY -1, 1-9) plus the undocumented codes that are
+# publicly known for this dataset (EDUCATION 0, MARRIAGE 0, PAY -2 and 0). MIMIC-III: the value sets of the
+# ADMISSIONS / ICUSTAYS tables restricted by the published cohort query (adults, so no NEWBORN admissions or
+# NICU stays; MARITAL_STATUS 'UNKNOWN' is the query's IFNULL value). Order defines the integer codes.
+_TW_PAY = [str(i) for i in range(-2, 10)]
+CAT_DOMAINS = {
+    "adult": {
+        "workclass": ["Federal-gov", "Local-gov", "Never-worked", "Private", "Self-emp-inc", "Self-emp-not-inc",
+                      "State-gov", "Without-pay"],
+        "education": ["10th", "11th", "12th", "1st-4th", "5th-6th", "7th-8th", "9th", "Assoc-acdm", "Assoc-voc",
+                      "Bachelors", "Doctorate", "HS-grad", "Masters", "Preschool", "Prof-school", "Some-college"],
+        "marital-status": ["Divorced", "Married-AF-spouse", "Married-civ-spouse", "Married-spouse-absent",
+                           "Never-married", "Separated", "Widowed"],
+        "occupation": ["Adm-clerical", "Armed-Forces", "Craft-repair", "Exec-managerial", "Farming-fishing",
+                       "Handlers-cleaners", "Machine-op-inspct", "Other-service", "Priv-house-serv",
+                       "Prof-specialty", "Protective-serv", "Sales", "Tech-support", "Transport-moving"],
+        "relationship": ["Husband", "Not-in-family", "Other-relative", "Own-child", "Unmarried", "Wife"],
+        "race": ["Amer-Indian-Eskimo", "Asian-Pac-Islander", "Black", "Other", "White"],
+        "sex": ["Female", "Male"],
+        "native-country": ["Cambodia", "Canada", "China", "Columbia", "Cuba", "Dominican-Republic", "Ecuador",
+                           "El-Salvador", "England", "France", "Germany", "Greece", "Guatemala", "Haiti",
+                           "Holand-Netherlands", "Honduras", "Hong", "Hungary", "India", "Iran", "Ireland", "Italy",
+                           "Jamaica", "Japan", "Laos", "Mexico", "Nicaragua", "Outlying-US(Guam-USVI-etc)", "Peru",
+                           "Philippines", "Poland", "Portugal", "Puerto-Rico", "Scotland", "South", "Taiwan",
+                           "Thailand", "Trinadad&Tobago", "United-States", "Vietnam", "Yugoslavia"],
+    },
+    "taiwan_credit": {"SEX": ["1", "2"], "EDUCATION": [str(i) for i in range(0, 7)],
+                      "MARRIAGE": ["0", "1", "2", "3"],
+                      **{c: _TW_PAY for c in ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]}},
+    "credit_fraud": {},
+    "mimic3": {
+        "GENDER": ["F", "M"],
+        "ADMISSION_TYPE": ["ELECTIVE", "EMERGENCY", "URGENT"],
+        "INSURANCE": ["Government", "Medicaid", "Medicare", "Private", "Self Pay"],
+        "MARITAL_STATUS": ["DIVORCED", "LIFE PARTNER", "MARRIED", "SEPARATED", "SINGLE", "UNKNOWN",
+                           "UNKNOWN (DEFAULT)", "WIDOWED"],
+        "FIRST_CAREUNIT": ["CCU", "CSRU", "MICU", "SICU", "TSICU"],
+    },
+}
+
+# Public bounds of continuous columns in raw units, from documentation or the published cohort query, never
+# from the records. Adult: age 17-90 (CPS extraction, top-coded at 90), 16 education levels, the capital fields'
+# top code 99999, hours 1-99. Taiwan: adult age 18-100 and NT$ amounts within +-1e7. Credit Card Fraud: Time
+# covers two days (172,800 s), amounts up to 1e5. MIMIC-III: the cohort query caps age at 90 and keeps
+# HR in (0, 300), SpO2 in (0, 100] and temperatures in (10, 50) degrees C. Columns not listed (Taiwan LIMIT_BAL,
+# Credit Card Fraud V1-V28, MIMIC-III length of stay and counts) get a private range.
+PUBLIC_BOUNDS = {
+    "adult": {"age": (17, 90), "education-num": (1, 16), "capital-gain": (0, 99_999),
+              "capital-loss": (0, 99_999), "hours-per-week": (1, 99)},
+    "taiwan_credit": {"AGE": (18, 100), **{f"BILL_AMT{i}": (-1e7, 1e7) for i in range(1, 7)},
+                      **{f"PAY_AMT{i}": (0, 1e7) for i in range(1, 7)}},
+    "credit_fraud": {"Time": (0, 172_800), "Amount": (0, 1e5)},
+    "mimic3": {"AGE": (18, 90), **{f"HR_{s}": (0, 300) for s in ("MIN", "MEAN", "MAX")},
+               **{f"SPO2_{s}": (0, 100) for s in ("MIN", "MEAN", "MAX")},
+               **{f"TEMP_{s}": (10, 50) for s in ("MIN", "MEAN", "MAX")}},
+}
+
 DATASET_PRESETS: Dict[str, DatasetConfig] = {
     "adult": DatasetConfig(
         name="adult", path=os.path.join(DATA_DIR, "adult.csv"), target_col="income",
@@ -203,6 +278,7 @@ DATASET_PRESETS: Dict[str, DatasetConfig] = {
         id_cols=["fnlwgt"],
         cat_cols=["workclass", "education", "marital-status", "occupation",
                   "relationship", "race", "sex", "native-country"],
+        cat_domains=CAT_DOMAINS["adult"], public_bounds=PUBLIC_BOUNDS["adult"],
         log1p_cols=["capital-gain", "capital-loss"],
         int_cols=["age", "education-num", "hours-per-week"],
         hard_bounds={"age": (17, 90), "education-num": (1, 16), "hours-per-week": (1, 99)},
@@ -214,6 +290,7 @@ DATASET_PRESETS: Dict[str, DatasetConfig] = {
         id_cols=["ID"],
         cat_cols=["SEX", "EDUCATION", "MARRIAGE", "PAY_0", "PAY_2", "PAY_3",
                   "PAY_4", "PAY_5", "PAY_6"],
+        cat_domains=CAT_DOMAINS["taiwan_credit"], public_bounds=PUBLIC_BOUNDS["taiwan_credit"],
         log1p_cols=[f"PAY_AMT{i}" for i in range(1, 7)],
         signed_log1p_cols=[f"BILL_AMT{i}" for i in range(1, 7)],
         int_cols=["AGE", "LIMIT_BAL"],
@@ -222,7 +299,7 @@ DATASET_PRESETS: Dict[str, DatasetConfig] = {
     "credit_fraud": DatasetConfig(
         name="credit_fraud", path=os.path.join(DATA_DIR, "creditcard.csv"), target_col="Class",
         target_candidates=["Class", "class", "target"],
-        cat_cols=[],
+        cat_cols=[], cat_domains=CAT_DOMAINS["credit_fraud"], public_bounds=PUBLIC_BOUNDS["credit_fraud"],
         log1p_cols=["Amount", "Time"],
         max_rows=100_000,   # all 492 frauds + 99,508 legitimate (as in the paper); set None for all 284,807
     ),
@@ -232,6 +309,7 @@ DATASET_PRESETS: Dict[str, DatasetConfig] = {
                  "EXPIRE_FLAG", "PRIMARY_ICD9", "DISCHARGE_LOCATION", "DEATHTIME",
                  "DOD", "HOSPITAL_EXPIRE_FLAG", "LANGUAGE", "ETHNICITY", "RELIGION"],
         cat_cols=["GENDER", "ADMISSION_TYPE", "INSURANCE", "MARITAL_STATUS", "FIRST_CAREUNIT"],
+        cat_domains=CAT_DOMAINS["mimic3"], public_bounds=PUBLIC_BOUNDS["mimic3"],
         log1p_cols=["HOSPITAL_LOS", "ICU_LOS", "NUM_DIAGNOSES", "NUM_PROCEDURES", "ICU_STAYS"],
         int_cols=["AGE"],
         hard_bounds={"AGE": (18, 90)},
@@ -261,6 +339,16 @@ HP_PRESETS: Dict[str, Dict] = {
 
 def hyperparams_for(dataset: str, overrides: Optional[Dict] = None) -> Hyperparams:
     hp = Hyperparams(**HP_PRESETS.get(dataset, {}))
+    for k, v in (overrides or {}).items():
+        if hasattr(hp, k):
+            setattr(hp, k, v)
+    return hp
+
+
+def global_hyperparams(overrides: Optional[Dict] = None) -> Hyperparams:
+    """The end-to-end protocol: the same Hyperparams defaults for every dataset (no per-dataset presets),
+    plus overrides selected without the target dataset (experiments/tune_lodo.py)."""
+    hp = Hyperparams()
     for k, v in (overrides or {}).items():
         if hasattr(hp, k):
             setattr(hp, k, v)
@@ -340,8 +428,18 @@ def load_dataset(cfg: DatasetConfig, verbose: bool = True):
 
     cat_cols = cfg.cat_cols if cfg.cat_cols is not None else _infer_categorical_columns(df, target)
     cat_cols = [c for c in cat_cols if c in df.columns]
+    outside = np.zeros(len(df), dtype=bool)
     for c in cat_cols:
-        df[c] = pd.Categorical(df[c].astype(str).str.strip()).codes
+        dom = (cfg.cat_domains or {}).get(c)
+        if dom is None:   # no public domain: codes of the observed values (earlier protocol only)
+            df[c] = pd.Categorical(df[c].astype(str).str.strip()).codes
+        else:             # codes = positions in the public domain
+            df[c] = pd.Categorical(df[c].astype(str).str.strip(), categories=list(dom)).codes
+            outside |= df[c].values < 0
+    if outside.any():
+        # a record-level rule that does not depend on other records
+        df = df[~outside].reset_index(drop=True)
+        print(f"  [load] dropped {int(outside.sum()):,} rows with a category outside the public domain")
 
     for c in cfg.log1p_cols:
         if c in df.columns:
@@ -522,6 +620,136 @@ def minority_statistics(min_np, cont_idx, n_cont_cols, n_cat_cols, epsilon=None,
     info = {"epsilon": float(epsilon), "delta": float(delta), "noise_multiplier": z, "sensitivity": sens,
             "n_hat": float(n_hat), "rel_noise": float(sd / n_hat)}
     return mean, std, info
+
+
+#  SECTION 2c ─ PUBLIC SCHEMA AND PRIVATE COLUMN SUMMARIES (encoder and column ranges)
+
+@dataclass
+class PublicSchema:
+    """What the data holder treats as public: the feature columns, the size of the category domain of every
+    categorical column, and the documented bounds of some continuous columns on the model scale (after the
+    log transforms of the DatasetConfig). Nothing in it is computed from the records."""
+    cont_cols: List[str]
+    cat_sizes: Dict[str, int]
+    bounds: Dict[str, Optional[tuple]]
+    nonneg: List[str] = field(default_factory=list)   # >= 0 by construction (log1p columns)
+
+
+def _model_scale(cfg: DatasetConfig, col: str, x: float) -> float:
+    x = float(x)
+    if col in cfg.log1p_cols:
+        return float(np.log1p(max(x, 0.0)))
+    if col in cfg.signed_log1p_cols:
+        return float(np.sign(x) * np.log1p(abs(x)))
+    return x
+
+
+def public_schema(cfg: DatasetConfig, columns, target: str, cat_cols: List[str]) -> PublicSchema:
+    """Schema of the end-to-end protocol from the DatasetConfig and the column names only."""
+    missing = [c for c in cat_cols if c not in (cfg.cat_domains or {})]
+    if missing:
+        raise ValueError(f"no public category domain for {missing}: add them to DatasetConfig.cat_domains "
+                         f"(or use the earlier protocol, encoder='data')")
+    cont = [c for c in columns if c != target and c not in cat_cols]
+    bounds = {c: (tuple(sorted(_model_scale(cfg, c, v) for v in cfg.public_bounds[c]))
+                  if c in cfg.public_bounds else None) for c in cont}
+    return PublicSchema(cont, {c: len(cfg.cat_domains[c]) for c in cat_cols}, bounds,
+                        nonneg=[c for c in cont if c in cfg.log1p_cols])
+
+
+# Stage-1 grid for columns without a public bound: a data-independent symmetric log2 grid,
+# (-inf, -2^23), ..., [-2, -1), [-1, 1) (the central bin), [1, 2), ..., [2^23, inf). The central bin is wide
+# so that columns centred at 0 do not fall into many small, noise-dominated bins.
+LOG_GRID_EDGES = np.concatenate([-(2.0 ** np.arange(24, -1, -1)), 2.0 ** np.arange(0, 25)])
+RANGE_THRESHOLD_SD = 3.0      # stage 1 keeps the bins whose noisy count exceeds this many noise sds
+
+
+def _bin_counts(v, edges):
+    """Every record falls in exactly one bin (values beyond the outer edges go to the outer bins)."""
+    idx = np.clip(np.searchsorted(edges, v, side="right") - 1, 0, len(edges) - 2)
+    return np.bincount(idx, minlength=len(edges) - 1).astype(float)
+
+
+def _contiguous_range(noisy, tau, max_gap=1):
+    """Bins around the largest noisy count, extended outwards while a bin within max_gap + 1 steps
+    exceeds tau (so one weak bin between two strong ones does not cut the range)."""
+    lo = hi = int(np.argmax(noisy))
+    while True:
+        nxt = [j for j in range(lo - 1, max(lo - 2 - max_gap, -1), -1) if noisy[j] > tau]
+        if not nxt:
+            break
+        lo = nxt[0]
+    while True:
+        nxt = [j for j in range(hi + 1, min(hi + 2 + max_gap, len(noisy))) if noisy[j] > tau]
+        if not nxt:
+            break
+        hi = nxt[0]
+    return lo, hi
+
+
+def dp_column_summaries(feat_df, schema: PublicSchema, epsilon, delta, rng, n_bins=64, range_frac=0.3,
+                        need_hist=True):
+    """Column ranges and per-column histograms for the encoder, released with one Gaussian mechanism.
+
+    Stage 1 (continuous columns without a public bound): a histogram of each such column on LOG_GRID_EDGES;
+    the range is the run of bins around the largest noisy count whose noisy counts exceed
+    RANGE_THRESHOLD_SD noise sds. Stage 2 (every continuous column, if need_hist): a histogram with n_bins
+    equal-width bins on the column's range (public bound or stage-1 range).
+    Under add/remove-one adjacency a record adds 1 to exactly one bin of every histogram of a stage, so the
+    L2 sensitivity of stage s is sqrt(d_s) for d_s histograms. With noise sd z * sqrt(d_s) / sqrt(w_s) and
+    w_1 + w_2 = 1, the two stages are 1/z-GDP in total (adaptive composition of Gaussian mechanisms; Dong,
+    Roth & Su 2022), i.e. exactly (epsilon, delta)-DP for z = gaussian_noise_multiplier(epsilon, delta),
+    the same analytic calibration as the minority statistics. The categorical domains are public and cost
+    nothing. epsilon=None: exact counts (No-DP runs use the same encoder construction without noise).
+    Ranges, the noisy-count clean-up and the GMMs fitted to the histograms are post-processing."""
+    cont = list(schema.cont_cols)
+    priv = [c for c in cont if schema.bounds.get(c) is None]
+    w1 = (range_frac if need_hist else 1.0) if priv else 0.0
+    w2 = (1.0 - w1) if (need_hist and cont) else 0.0
+    released = w1 > 0 or w2 > 0
+    z = 0.0 if (epsilon is None or not released) else gaussian_noise_multiplier(epsilon, delta)
+    sd1 = z / math.sqrt(w1) * math.sqrt(len(priv)) if w1 > 0 else 0.0
+    sd2 = z / math.sqrt(w2) * math.sqrt(len(cont)) if w2 > 0 else 0.0
+    ranges, source, hists = {}, {}, {}
+    for c in cont:
+        if schema.bounds.get(c) is not None:
+            ranges[c], source[c] = tuple(map(float, schema.bounds[c])), "public"
+            continue
+        noisy = _bin_counts(feat_df[c].values.astype(float), LOG_GRID_EDGES)
+        if sd1 > 0:
+            noisy = noisy + rng.normal(0.0, sd1, len(noisy))
+        lo, hi = _contiguous_range(noisy, RANGE_THRESHOLD_SD * sd1)
+        lo_v, hi_v = float(LOG_GRID_EDGES[lo]), float(LOG_GRID_EDGES[hi + 1])
+        if c in schema.nonneg:   # schema knowledge, not data
+            lo_v, hi_v = max(lo_v, 0.0), max(hi_v, 1.0)
+        ranges[c], source[c] = (lo_v, hi_v), "private"
+    if need_hist:
+        for c in cont:
+            lo, hi = ranges[c]
+            edges = np.linspace(lo, hi, n_bins + 1)
+            noisy = _bin_counts(np.clip(feat_df[c].values.astype(float), lo, hi), edges)
+            if sd2 > 0:
+                # subtracting one sd suppresses the noise mass in empty bins (post-processing)
+                noisy = np.clip(noisy + rng.normal(0.0, sd2, len(noisy)) - sd2, 0.0, None)
+            hists[c] = (edges, noisy)
+    info = {"private": epsilon is not None and released, "epsilon": float(epsilon) if epsilon is not None else None,
+            "delta": float(delta) if epsilon is not None else None, "noise_multiplier": float(z),
+            "n_private_ranges": len(priv), "n_continuous": len(cont), "stage_weights": [w1, w2],
+            "noise_sd_ranges": float(sd1), "noise_sd_hist": float(sd2), "n_bins": int(n_bins),
+            "range_source": source, "ranges": ranges}
+    return {"ranges": ranges, "hists": hists, "info": info}
+
+
+def _gmm_from_hist(edges, counts, n_modes, rng, n_sample=20000):
+    """GMM fitted to points drawn uniformly within the bins of a (noisy) histogram: post-processing."""
+    counts = np.asarray(counts, dtype=float)
+    if counts.sum() <= 0:
+        counts = np.ones_like(counts)
+    nm = min(n_modes, max(1, int((counts > 0).sum()) // 2))
+    b = rng.choice(len(counts), n_sample, p=counts / counts.sum())
+    x = edges[b] + rng.random(n_sample) * (edges[b + 1] - edges[b])
+    gm = GaussianMixture(n_components=nm, random_state=42, covariance_type="full", reg_covar=1e-4)
+    return gm.fit(x.reshape(-1, 1))
 
 
 #  SECTION 3 ─ DISTRIBUTION METRICS + MIA + PRIVACY GATE
@@ -775,10 +1003,19 @@ def quantile_match(synth_df, ref_df, feat_cols, blend, orig_df=None):
     return matched
 
 
-def postprocess_synthetic(synth_df, ref_df, target_col, cat_cols, int_cols, hard_bounds, verbose=False):
+def postprocess_synthetic(synth_df, ref_df, target_col, cat_cols, int_cols, hard_bounds, verbose=False,
+                          bounds=None, cat_sizes=None):
+    """Clip continuous columns, round integer columns and clip category codes.
+    bounds / cat_sizes given (end-to-end protocol): the released column ranges and the public domain sizes,
+    so ref_df is not read. Otherwise (earlier protocol): the range and the number of codes of ref_df, the
+    training data, intersected with hard_bounds."""
     df = synth_df.copy()
     feat_cols = [c for c in df.columns if c != target_col]
     for c in feat_cols:
+        if bounds is not None:
+            if c in bounds and c not in cat_cols:
+                df[c] = np.clip(df[c].values.astype(float), *bounds[c])
+            continue
         if c not in ref_df.columns:
             continue
         lo_hard, hi_hard = hard_bounds.get(c, (-np.inf, np.inf))
@@ -791,10 +1028,16 @@ def postprocess_synthetic(synth_df, ref_df, target_col, cat_cols, int_cols, hard
         if c in df.columns:
             df[c] = np.round(df[c].values.astype(float)).astype(int)
     for c in cat_cols:
-        if c in df.columns and c in ref_df.columns:
+        if c not in df.columns:
+            continue
+        if cat_sizes is not None:
+            n_codes = int(cat_sizes[c])
+        elif c in ref_df.columns:
             n_codes = int(ref_df[c].nunique())
-            if n_codes >= 2:
-                df[c] = np.clip(np.round(df[c].values.astype(float)).astype(int), 0, n_codes - 1)
+        else:
+            continue
+        if n_codes >= 2:
+            df[c] = np.clip(np.round(df[c].values.astype(float)).astype(int), 0, n_codes - 1)
     if verbose:
         print(f"  [PostProc] rows={len(df):,}")
     return df
@@ -807,8 +1050,10 @@ class ModeNormalizer:
         self.n_modes = n_modes
         self.gmms_, self.cat_nvals_, self._slices = {}, {}, {}
         self.cont_cols_, self.cat_cols_, self.out_dim_ = [], [], 0
+        self.ranges_ = {}          # clipping range of every continuous column used when decoding
 
     def fit(self, df, discrete_cols):
+        """Earlier protocol: GMMs, category counts and ranges fitted on the training data (not private)."""
         self.cont_cols_ = [c for c in df.columns if c not in discrete_cols]
         self.cat_cols_ = [c for c in discrete_cols if c in df.columns]
         idx = 0
@@ -820,9 +1065,32 @@ class ModeNormalizer:
             gm.fit(v + (np.random.normal(0, 1e-6, v.shape) if uq < 2 else 0))
             self.gmms_[c] = gm
             self._slices[c] = slice(idx, idx + 1 + nm)
+            self.ranges_[c] = (float(v.min()), float(v.max()))
             idx += 1 + nm
         for c in self.cat_cols_:
             nv = max(int(df[c].max()) + 1, int(df[c].nunique()), 1)
+            self.cat_nvals_[c] = nv
+            self._slices[c] = slice(idx, idx + nv)
+            idx += nv
+        self.out_dim_ = idx
+        return self
+
+    def fit_public(self, feat_cols, schema: "PublicSchema", summaries, rng):
+        """End-to-end protocol: category domains from the public schema; GMMs and ranges from the output of
+        dp_column_summaries. The records are not read here, so the encoder is post-processing."""
+        self.cont_cols_ = [c for c in feat_cols if c in schema.cont_cols]
+        self.cat_cols_ = [c for c in feat_cols if c in schema.cat_sizes]
+        idx = 0
+        for c in self.cont_cols_:
+            edges, counts = summaries["hists"][c]
+            gm = _gmm_from_hist(edges, counts, self.n_modes, rng)
+            self.gmms_[c] = gm
+            nm = len(gm.means_)
+            self._slices[c] = slice(idx, idx + 1 + nm)
+            self.ranges_[c] = tuple(summaries["ranges"][c])
+            idx += 1 + nm
+        for c in self.cat_cols_:
+            nv = int(schema.cat_sizes[c])
             self.cat_nvals_[c] = nv
             self._slices[c] = slice(idx, idx + nv)
             idx += nv
@@ -853,7 +1121,8 @@ class ModeNormalizer:
             out[rows, sl.start + (vals % nv)] = 1.
         return out
 
-    def inverse_transform(self, data, orig_df):
+    def inverse_transform(self, data, orig_df=None):
+        """orig_df is unused (kept for compatibility); values are clipped to self.ranges_."""
         data = np.asarray(data)
         res = {}
         for c in self.cont_cols_:
@@ -862,7 +1131,7 @@ class ModeNormalizer:
             stds = np.sqrt(gm.covariances_.reshape(len(gm.means_), -1)[:, 0])[m]
             means = gm.means_.flatten()[m]
             val = data[:, sl.start].astype(float) * 4. * stds + means
-            res[c] = np.clip(val, float(orig_df[c].min()), float(orig_df[c].max()))
+            res[c] = np.clip(val, *self.ranges_[c])
         for c in self.cat_cols_:
             sl = self._slices[c]
             res[c] = np.argmax(data[:, sl], axis=1) % self.cat_nvals_[c]
@@ -1089,6 +1358,7 @@ class DPCTGAN:
         self.epsilon_total = float('inf')     # all components (basic composition); = _actual_epsilon in nonprivate mode
         self.dp_info = {}
         self.budget = {}
+        self.encoder_info = {}
         self.judge = None
         self._mm_weight = 1.0
 
@@ -1110,32 +1380,52 @@ class DPCTGAN:
         return self._data_tensor[idx].to(DEVICE), self._label_tensor[idx].to(DEVICE)
 
     # -- training -------------------------------------------------------
-    def fit(self, df, discrete_columns, target_col, ds_name=""):
+    def fit(self, df, discrete_columns, target_col, ds_name="", schema: Optional[PublicSchema] = None):
+        """schema: the public schema (public_schema()); required with hp.encoder = "dp"."""
         t0 = time.time()
         hp = self.hp
         self._target_col = target_col
         feat_df = df.drop(columns=[target_col])
         self._feat_cols = list(feat_df.columns)
-        self._orig_df = feat_df.copy()
-        self._norm = ModeNormalizer().fit(feat_df, [c for c in discrete_columns if c != target_col])
-        data_np = self._norm.transform(feat_df)
-        data_dim = data_np.shape[1]
-        n = len(df)
+        n = len(df)     # public nominal size N (delta, sampling rates, stream size)
         if self.delta is None:
             self.delta = min(1e-5, 1.0 / (10 * n))
         dp_mode = hp.privacy_mode == "dp"
+        private_encoder = hp.encoder == "dp"
+        if hp.encoder not in ("dp", "data"):
+            raise ValueError(f"unknown encoder {hp.encoder!r}")
 
-        # ---- privacy budget split (dp mode): discriminator / minority statistics / judge ----
+        # ---- privacy budget split (dp mode): [encoder /] discriminator / minority statistics / judge ----
         f_judge = hp.budget_frac_judge if (dp_mode and hp.judge_type == "mlp") else 0.0
         f_stats = hp.budget_frac_stats if dp_mode else 0.0
+        f_enc = hp.budget_frac_encoder if (dp_mode and private_encoder) else 0.0
+        self.delta_each = self.delta / (4.0 if f_enc > 0 else 3.0)
         if self.use_dp and dp_mode:
-            self.eps_gan = self.epsilon * (1.0 - f_judge - f_stats)
-            self.delta_gan = self.delta / 3.0
+            self.eps_gan = self.epsilon * (1.0 - f_judge - f_stats - f_enc)
+            self.delta_gan = self.delta_each
             self.budget = {"epsilon_target": float(self.epsilon), "delta": float(self.delta),
                            "epsilon_gan": float(self.eps_gan), "epsilon_stats": float(self.epsilon * f_stats),
-                           "epsilon_judge": float(self.epsilon * f_judge), "delta_each": float(self.delta / 3.0)}
+                           "epsilon_judge": float(self.epsilon * f_judge),
+                           "epsilon_encoder": float(self.epsilon * f_enc), "delta_each": float(self.delta_each),
+                           "encoder": hp.encoder}
         else:
             self.eps_gan, self.delta_gan = self.epsilon, self.delta
+
+        # ---- column encoder ----
+        if private_encoder:
+            if schema is None:
+                raise ValueError("encoder='dp' needs the public schema: fit(..., schema=public_schema(cfg, ...))")
+            rng_enc = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+            eps_enc = self.epsilon * f_enc if (self.use_dp and f_enc > 0) else None
+            summ = dp_column_summaries(feat_df, schema, eps_enc, self.delta_each, rng_enc,
+                                       n_bins=hp.encoder_bins, range_frac=hp.encoder_range_frac)
+            self._norm = ModeNormalizer().fit_public(self._feat_cols, schema, summ, rng_enc)
+            self.encoder_info = summ["info"]
+        else:
+            self._norm = ModeNormalizer().fit(feat_df, [c for c in discrete_columns if c != target_col])
+            self.encoder_info = {"private": False, "fitted_on": "training data"}
+        data_np = self._norm.transform(feat_df)
+        data_dim = data_np.shape[1]
 
         labels = df[target_col].values.astype(int)
         self._minority_idx = np.where(labels == 1)[0]
@@ -1146,7 +1436,7 @@ class DPCTGAN:
         if self.use_dp and dp_mode:
             mean, std, self.stats_info = minority_statistics(
                 min_np, self._cont_idx, len(self._norm.cont_cols_), len(self._norm.cat_cols_),
-                epsilon=self.epsilon * f_stats, delta=self.delta / 3.0,
+                epsilon=self.epsilon * f_stats, delta=self.delta_each,
                 rng=np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item())))
             # down-weight moment matching when the released moments are dominated by noise
             # (a function of released quantities only, i.e. post-processing)
@@ -1320,7 +1610,7 @@ class DPCTGAN:
                 n_hat = self.stats_info["n_hat"]
                 pos_weight = max(n - n_hat, 1.0) / max(n_hat, 1.0)
                 self.judge = MLPJudge(self._norm, self._feat_cols, hp).fit(
-                    feat_df, labels, epsilon=eps_j, delta=self.delta / 3.0 if self.use_dp else None,
+                    feat_df, labels, epsilon=eps_j, delta=self.delta_each if self.use_dp else None,
                     pos_weight=pos_weight)
             elif hp.judge_type == "disc":
                 self.judge = DiscJudge(self)
@@ -1336,8 +1626,17 @@ class DPCTGAN:
             if isinstance(self.judge, MLPJudge) and self.judge.private:
                 hist += self.judge.history
                 eps_parts.append(self.judge.info["achieved_epsilon"])
+            eps_enc_spent = 0.0
+            if self.encoder_info.get("private"):
+                # the two encoder stages compose to one Gaussian mechanism with this noise multiplier
+                hist.append((self.encoder_info["noise_multiplier"], 1.0, 1))
+                eps_enc_spent = float(self.encoder_info["epsilon"])
+                eps_parts.append(eps_enc_spent)
             self.epsilon_total = float(sum(eps_parts))
             self.budget.update({"epsilon_gan_achieved": float(self._actual_epsilon),
+                                "epsilon_encoder_achieved": eps_enc_spent,
+                                "encoder_noise_multiplier": float(self.encoder_info.get("noise_multiplier", 0.0)),
+                                "encoder_n_private_ranges": int(self.encoder_info.get("n_private_ranges", 0)),
                                 "epsilon_total_basic": self.epsilon_total,
                                 "epsilon_total_rdp": rdp_total_epsilon(hist, self.delta),
                                 "stats_noise_multiplier": self.stats_info["noise_multiplier"],
@@ -1351,8 +1650,9 @@ class DPCTGAN:
                                     "judge_steps": self.judge.info["steps"],
                                     "epsilon_judge_achieved": self.judge.info["achieved_epsilon"]})
             if self.verbose:
-                print(f"  privacy: eps_gan={self._actual_epsilon:.3f} eps_stats={self.stats_info['epsilon']:.3f} "
-                      f"eps_judge={eps_parts[2] if len(eps_parts) > 2 else 0:.3f} -> total "
+                print(f"  privacy: eps_enc={eps_enc_spent:.3f} eps_gan={self._actual_epsilon:.3f} "
+                      f"eps_stats={self.stats_info['epsilon']:.3f} "
+                      f"eps_judge={self.budget.get('epsilon_judge_achieved', 0):.3f} -> total "
                       f"{self.epsilon_total:.3f} (basic), {self.budget['epsilon_total_rdp']:.3f} (RDP); "
                       f"moment noise/n={self.stats_info['rel_noise']:.3f}, mm_weight={self._mm_weight:.2f}")
 
@@ -1365,8 +1665,13 @@ class DPCTGAN:
 
     # -- sampling -------------------------------------------------------
     def _decode(self, raw):
-        synth = self._norm.inverse_transform(raw, self._orig_df)
+        synth = self._norm.inverse_transform(raw)
         return synth[self._feat_cols].reset_index(drop=True)
+
+    def release_bounds(self):
+        """(column ranges, category domain sizes) of the encoder, for postprocess_synthetic. With the private
+        encoder these are released quantities (public bounds or private ranges) and the public domains."""
+        return dict(self._norm.ranges_), dict(self._norm.cat_nvals_)
 
     def _sample_raw(self, n, mode, batch=2048):
         rows = []
@@ -1554,7 +1859,7 @@ def target_cat_cols(df, feat_cols, target, max_card=20):
 
 
 def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_val,
-                target, feat_cols, cat_cols, base_hp: Hyperparams, n_trials=8, seed=42):
+                target, feat_cols, cat_cols, base_hp: Hyperparams, n_trials=8, seed=42, schema=None):
     """Tunes gan_epochs / learning rates / batch size / (max_grad_norm if DP) against
     validation TSTR AUC penalised by KS/JS distance and excess kNN-MIA AUC."""
     if optuna is None:
@@ -1573,7 +1878,7 @@ def optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_
             hp.r1_gamma = trial.suggest_float("r1_gamma", 5.0, 15.0)
         try:
             model = DPCTGAN(epsilon=epsilon, hp=hp, verbose=False)
-            model.fit(gan_train_df, cat_cols, target, ds_name="optuna_trial")
+            model.fit(gan_train_df, cat_cols, target, ds_name="optuna_trial", schema=schema)
             synth = model.sample_common(len(gan_train_df))
             X_tr = sc_val.transform(_ensure_numeric(synth, target)[feat_cols].values.astype(float))
             y_tr = synth[target].values.astype(int)
@@ -1613,6 +1918,7 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
     df, target, cat_cols = load_dataset(cfg)
     feat = [c for c in df.columns if c != target]
     cont_cols = [c for c in feat if c not in cat_cols]
+    schema = public_schema(cfg, df.columns, target, cat_cols) if hp.encoder == "dp" else None
     y_all = df[target].values.astype(int)
 
     i_aug, i_te = train_test_split(np.arange(len(df)), test_size=hp.test_split,
@@ -1643,15 +1949,17 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
         y_val = val_df[target].values.astype(int)
         print(f"\n  Tuning hyperparameters (Optuna, {n_optuna_trials} trials)...")
         hp = optuna_tune(epsilon, gan_train_df, val_df, mia_holdout_df, sc_val, X_val, y_val,
-                         target, feat, cat_cols, hp, n_trials=n_optuna_trials)
+                         target, feat, cat_cols, hp, n_trials=n_optuna_trials, schema=schema)
 
     print(f"\n  Training DP-CTGAN  (epsilon={'No-DP' if epsilon is None else epsilon})...")
     model = DPCTGAN(epsilon=epsilon, hp=hp, verbose=True)
-    model.fit(aug_df, cat_cols, target, ds_name=cfg.name)
+    model.fit(aug_df, cat_cols, target, ds_name=cfg.name, schema=schema)
+    bounds, cat_sizes = model.release_bounds() if schema is not None else (None, None)
 
     n_aug = len(aug_df)
     common_df = model.sample_common(n_aug)
-    common_df = postprocess_synthetic(common_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
+    common_df = postprocess_synthetic(common_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds,
+                                      bounds=bounds, cat_sizes=cat_sizes)
     if hp.privacy_filter_enabled:
         common_df = privacy_realism_filter(common_df, aug_df, feat, desired_n=n_aug, label="common",
                                            max_ref=hp.privacy_max_ref)
@@ -1665,7 +1973,8 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
         if hp.quantile_blend > 0:
             rare_df = quantile_match(rare_df, real_minority, cont_cols, blend=hp.quantile_blend, orig_df=aug_df)
         rare_df[target] = 1
-        rare_df = postprocess_synthetic(rare_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
+        rare_df = postprocess_synthetic(rare_df, aug_df, target, cat_cols, cfg.int_cols, cfg.hard_bounds,
+                                        bounds=bounds, cat_sizes=cat_sizes)
         if hp.privacy_filter_enabled:
             rare_df = privacy_realism_filter(rare_df, real_minority, feat, desired_n=n_rare_need,
                                              label="rare", max_ref=hp.privacy_max_ref)
@@ -1683,7 +1992,7 @@ def run_pipeline(cfg: DatasetConfig, epsilon: Optional[float], hp: Hyperparams =
 
     metrics = {
         "epsilon": epsilon, "actual_epsilon": model.epsilon_total, "dp_info": model.dp_info,
-        "privacy_mode": hp.privacy_mode, "budget": model.budget,
+        "privacy_mode": hp.privacy_mode, "encoder": hp.encoder, "budget": model.budget,
         "rf_auc": tstr["auc"], "rf_auprc": tstr["auprc"], "rf_f1": tstr["f1"],
         "knn_auc": tstr["knn_auc"], "knn_auprc": tstr["knn_auprc"],
         "ks_mean": ks_mean, "js_mean": js_mean,
@@ -1717,6 +2026,9 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mode", choices=["nonprivate", "dp"], default="dp",
                    help="'dp': every component that reads real data is covered by epsilon (see apply_privacy_mode)")
+    p.add_argument("--encoder", choices=["dp", "data"], default="dp",
+                   help="'dp': encoder and column ranges from the public schema and a share of epsilon "
+                        "(needs DatasetConfig.cat_domains); 'data': fitted on the training data, outside epsilon")
     p.add_argument("--out", type=str, default="output")
     args = p.parse_args()
 
@@ -1739,6 +2051,7 @@ def main():
     if args.delta is not None:
         hp.delta = args.delta
     apply_privacy_mode(hp, args.mode)
+    hp.encoder = args.encoder
     run_pipeline(cfg, epsilon, hp=hp, tune=args.tune, n_optuna_trials=args.trials, out_dir=args.out)
 
 

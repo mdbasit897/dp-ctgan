@@ -72,7 +72,8 @@ BASELINE_STYLE = {"pategan": dict(color="#009E73", marker="^", ls="-.", label="P
                   "sn_patectgan": dict(color="#F0E442", marker="h", ls=(0, (3, 1)), label="PATE-CTGAN (SmartNoise)"),
                   "sn_mst": dict(color="#882255", marker="p", ls=(0, (5, 1, 1, 1)), label="MST (SmartNoise)")}
 # matched SmartNoise runs: RareSel-DP's delta and public column bounds (same style; one variant per figure)
-BASELINE_STYLE.update({f"{m}_matched": BASELINE_STYLE[m] for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
+BASELINE_STYLE.update({f"{m}_{v}": BASELINE_STYLE[m] for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")
+                       for v in ("matched", "e2e")})
 EPS_POS = ["1", "3", "10", "nodp"]
 EPS_LBL = {"1": "1", "3": "3", "10": "10", "nodp": "No DP"}
 FULL_W, HALF_W = 6.8, 3.3   # inches (ACM text width ~ 6.8 in, column ~ 3.3 in)
@@ -227,10 +228,12 @@ def fig_privacy_utility(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)"):
 def fig_baselines(df, out, metric="rf_auprc", ylabel="RF AUPRC (test)", sn_variant="matched"):
     """sn_variant: which SmartNoise runs to draw, 'matched' (falls back to 'default' when there are none)
     or 'default' (library defaults)."""
-    if sn_variant == "matched" and not df.method.astype(str).str.endswith("_matched").any():
+    if sn_variant in ("matched", "e2e") and not df.method.astype(str).str.endswith("_" + sn_variant).any():
         sn_variant = "default"
-    skip = (lambda m: m.startswith("sn_") and not m.endswith("_matched")) if sn_variant == "matched" \
-        else (lambda m: m.endswith("_matched"))
+    if sn_variant == "default":
+        skip = lambda m: m.endswith("_matched") or m.endswith("_e2e")
+    else:
+        skip = lambda m: m.startswith("sn_") and not m.endswith("_" + sn_variant)
     print(f"  fig_baselines: SmartNoise variant = {sn_variant}")
     meths = [m for m in BASELINE_STYLE if (df.method == m).any() and not skip(m)]
     if not meths:
@@ -615,7 +618,7 @@ def main():
                     help="datasets in the t-SNE figures (default leaves out MIMIC-III: the panel plots real patients)")
     ap.add_argument("--sampler-fig", action="store_true",
                     help="also draw fig_sampler_scores (flow scores; the ablation shows the flows do not matter)")
-    ap.add_argument("--sn-variant", choices=["matched", "default"], default="matched",
+    ap.add_argument("--sn-variant", choices=["e2e", "matched", "default"], default="e2e",
                     help="SmartNoise baselines in fig_baselines: matched delta/bounds or library defaults")
     a = ap.parse_args()
     out = os.path.join(a.results, "figures")

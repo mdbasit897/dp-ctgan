@@ -11,21 +11,29 @@ correlation difference) and empirical privacy (kNN-MIA, DOMIAS, LR-MIA, DCR shar
 
 ## Privacy
 
-RareSel-DP (`--mode dp`, the default) spends one (ε, δ) budget on the three components that read
-training records: the DP-SGD discriminator (0.8 ε), the minority count, mean and standard deviation
-released with the Gaussian mechanism (0.1 ε), and a DP-SGD MLP judge (0.1 ε), each at δ/3. In every
-discriminator step the generated half of the batch has a fixed size and conditions drawn at the
-released minority rate, independent of which real records were sampled, so each step has
-sensitivity C. The generator, both synthetic streams and the sampler are post-processing.
+RareSel-DP (`--mode dp`) releases data that are (ε, δ)-DP end to end. One budget is split between the
+four mechanisms that read training records, each at δ/4:
 
-The guarantee assumes that the column encoder, the column ranges and the training-set size are
-public. In the experiments they are fitted to the training split, and the hyperparameter search is
-not included in ε; see the paper's privacy section.
+| Mechanism | Share of ε | What it releases |
+|---|---|---|
+| Column encoder | 0.05 | Gaussian-mechanism histograms of the continuous columns: private ranges for columns without a public bound (30% of the share) and 64-bin histograms on every column's range (70%); the GMM mode encoder is fitted to these histograms |
+| Discriminator | 0.75 | DP-SGD (Opacus, RDP accountant); the generated half of every batch has a fixed size, so each step has sensitivity C |
+| Minority statistics | 0.10 | noisy minority count, mean and standard deviation (Gaussian mechanism) |
+| Judge | 0.10 | DP-SGD MLP minority classifier |
 
-`--mode nonprivate` is the non-private variant reported in the paper as an upper reference and used
-as the tuning configuration: it adds feature and correlation matching on real batches, exact
-minority statistics, a random-forest judge trained on real data, quantile matching and PrivacyGate
-filtering. Its output is **not** differentially private.
+The schema is public and never computed from the records: the category domain of every categorical
+column (`CAT_DOMAINS`, from the dataset documentation and the published MIMIC-III cohort query) and
+documented bounds of continuous columns (`PUBLIC_BOUNDS`). The training-set size N is treated as
+public. The generator, both synthetic streams, the sampler and all clipping (to the released ranges)
+are post-processing. Hyperparameters are either the same defaults for every dataset (`Hyperparams`)
+or chosen by leave-one-dataset-out transfer (`experiments/tune_lodo.py`): the configuration used for a
+dataset is selected on the other three, so model selection reads none of its records.
+
+`--encoder data` reproduces the public-encoder assumption (encoder and ranges fitted on the training
+split outside ε, budget 0.8/0.1/0.1 at δ/3) as an ablation; `--protocol legacy` is the earlier
+protocol with per-dataset presets. `--mode nonprivate` is the non-private variant (feature and
+correlation matching on real batches, exact minority statistics, a random-forest judge on real data,
+quantile matching, PrivacyGate filtering); its output is **not** differentially private.
 
 ## Repository layout
 
@@ -38,7 +46,8 @@ data/
   prepare_mimic3.py            runs the query and writes data/mimic3.csv
 experiments/
   common.py                    shared splits (64/8/8/20) and evaluation
-  tune.py                      Optuna search per dataset and ε -> results/hparams/*.json
+  tune_lodo.py                 leave-one-dataset-out hyperparameter selection -> results_e2e/hparams_lodo/
+  tune.py                      Optuna search per dataset and ε (earlier protocol) -> results/hparams/*.json
   run_experiments.py           resumable grid: datasets × ε × seeds (+ ablations)
   run_baselines.py             SmartNoise / synthcity / SMOTE baselines on identical splits
   aggregate.py                 CSV summaries, LaTeX tables, Wilcoxon tests -> <results>/summary/
@@ -57,18 +66,18 @@ results/                       non-private variant (<dataset>/), baselines (base
 
 ## Published outputs
 
-Each run folder contains `metrics.json` (utility, fidelity, attacks, PrivacyGate audit, DP accounting
-of every component, sampler diagnostics, timings). `results_dp/summary/` and
-`results_dp_untuned/summary/` contain `runs.csv`, `mean_std.csv`, `stats.txt` (all significance
-tests) and the LaTeX tables; `results_dp/figures/` contains the figures. Synthetic data, per-record
-predictions and attack scores are not published; the MIMIC-III-derived ones may not be shared under
-the PhysioNet data use agreement. Every published number can be recomputed from `metrics.json`:
-
-```bash
-python3 experiments/aggregate.py --results results_dp --baselines-dir results/baselines --nonprivate-results results --ablation-eps 3
-python3 experiments/aggregate.py --results results_dp_untuned --ablation-eps 3
-python3 experiments/make_paper_tables.py --out paper_tables
 ```
+results_e2e/                   RareSel-DP, end-to-end protocol, LODO hyperparameters: 4 datasets x {No-DP, 1, 3, 10} x 5 seeds
+results_e2e/hparams_lodo/      candidate scores, selected configurations (one JSON per dataset and setting)
+results_e2e_untuned/           the same grid with the global defaults (no tuning at all)
+results_e2e_pubenc/            ablation: same hyperparameters, encoder fitted on the training split (outside eps)
+results_e2e/baselines/         SmartNoise DP-CTGAN / PATE-CTGAN / MST (end-to-end, *_e2e), CTGAN, TVAE, SMOTE
+```
+
+Each run folder contains `metrics.json` (utility, fidelity, attacks, PrivacyGate audit, the DP
+accounting of every component including the encoder, the released column ranges and their source,
+sampler diagnostics, timings). Synthetic data, per-record predictions and attack scores are not
+published; the MIMIC-III-derived ones may not be shared under the PhysioNet data use agreement.
 
 ## Reproducing the experiments
 
@@ -79,47 +88,42 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -r requirement
 
 # 1. Data
 python3 data/prepare_public_datasets.py                    # adult.csv, UCI_Credit_Card.csv, creditcard.csv
-gcloud auth application-default login --no-launch-browser  # Google account linked to PhysioNet
-python3 data/prepare_mimic3.py --project YOUR_PROJECT_ID    # mimic3.csv
+python3 data/prepare_mimic3.py --project YOUR_PROJECT_ID    # mimic3.csv (PhysioNet-linked Google account)
 
-# 2. Hyperparameter search (20 Optuna trials per dataset and setting on the seed-0 split,
-#    non-private tuning configuration; see the paper's appendix)
-mkdir -p logs
-for ds in adult taiwan_credit credit_fraud mimic3; do
-  python3 experiments/tune.py --datasets $ds --trials 20 > logs/tune_$ds.log 2>&1 &
+# 2. Leave-one-dataset-out hyperparameter selection (24 candidates x 4 datasets x 4 settings)
+for i in 0 1 2 3 4 5 6 7; do
+  python3 experiments/tune_lodo.py score --shard $i/8 > logs/lodo_$i.log 2>&1 &
+done; wait
+python3 experiments/tune_lodo.py select
+
+# 3. RareSel-DP grids
+for i in 0 1 2 3 4 5 6 7; do      # main grid with ablations
+  python3 experiments/run_experiments.py --shard $i/8 --ablations --hp-dir results_e2e/hparams_lodo \
+    --out results_e2e > logs/e2e_$i.log 2>&1 &
+done; wait
+for i in 0 1 2 3 4 5 6 7; do      # no tuning, and the public-encoder ablation
+  python3 experiments/run_experiments.py --shard $i/8 --hp-dir none --out results_e2e_untuned > logs/untuned_$i.log 2>&1 &
+done; wait
+for i in 0 1 2 3 4 5 6 7; do
+  python3 experiments/run_experiments.py --shard $i/8 --encoder data --hp-dir results_e2e/hparams_lodo \
+    --out results_e2e_pubenc > logs/pubenc_$i.log 2>&1 &
 done; wait
 
-# 3. RareSel-DP grid with ablations (80 runs; 4 workers)
-for i in 0 1 2 3; do
-  python3 experiments/run_experiments.py --mode dp --shard $i/4 --ablations \
-    --hp-dir results/hparams --out results_dp > logs/dp_$i.log 2>&1 &
-done; wait
-#    the same grid with the dataset presets and no tuning
-for i in 0 1 2 3; do
-  python3 experiments/run_experiments.py --mode dp --shard $i/4 --hp-dir none \
-    --out results_dp_untuned > logs/untuned_$i.log 2>&1 &
-done; wait
-#    non-private variant (upper reference)
-python3 experiments/run_experiments.py --mode nonprivate --ablations --hp-dir results/hparams --out results
-
-# 4. Baselines on the same splits
-python3 experiments/run_baselines.py --methods ctgan tvae --eps none --seeds 0 1 2
-python3 experiments/run_baselines.py --methods smote --eps none
-#    AIM (synthcity), reported in the appendix only: 3-4 h per run on Adult
-python3 experiments/run_baselines.py --methods aim --datasets adult --eps 1 3 10 --seeds 0 --out results/aim_attempt
-python3 experiments/run_baselines.py --methods aim --datasets adult --eps 1 --seeds 1 2 --out results/aim_attempt
-#    SmartNoise needs its own environment (smartnoise-synth 1.0.8 pins an older Opacus)
+# 4. Baselines on the same splits (SmartNoise needs its own environment: smartnoise-synth 1.0.8 pins an older Opacus)
 uv venv --python 3.11 .venv-sn
 uv pip install --python .venv-sn/bin/python --torch-backend auto smartnoise-synth==1.0.8 scikit-learn pandas scipy
-.venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan sn_patectgan sn_mst --eps 1 3 10 --seeds 0 1 2
-.venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan sn_patectgan sn_mst --eps 1 3 10 --matched --seeds 0 1 2 3 4
+.venv-sn/bin/python experiments/run_baselines.py --methods sn_dpctgan sn_patectgan sn_mst --e2e \
+    --seeds 0 1 2 3 4 --out results_e2e/baselines
+python3 experiments/run_baselines.py --methods ctgan tvae --eps none --seeds 0 1 2 --out results_e2e/baselines
+python3 experiments/run_baselines.py --methods smote --eps none --out results_e2e/baselines
 
 # 5. Tables, figures, checks
-python3 experiments/aggregate.py --results results_dp --baselines-dir results/baselines --nonprivate-results results --ablation-eps 3
-python3 experiments/aggregate.py --results results_dp_untuned --ablation-eps 3
-python3 experiments/make_figures.py --results results_dp --fig-eps 3
-python3 experiments/check_outputs.py --results results_dp --baselines-dir results/baselines
-python3 experiments/make_paper_tables.py --out paper_tables
+python3 experiments/aggregate.py --results results_e2e --baselines-dir results_e2e/baselines --ablation-eps 3
+python3 experiments/aggregate.py --results results_e2e_untuned --ablation-eps 3
+python3 experiments/aggregate.py --results results_e2e_pubenc --ablation-eps 3
+python3 experiments/make_figures.py --results results_e2e --fig-eps 3
+python3 experiments/check_outputs.py --results results_e2e --baselines-dir results_e2e/baselines \
+    --hp-dir results_e2e/hparams_lodo --baseline-seeds 3
 ```
 
 Every run writes its own `metrics.json` and finished runs are skipped, so any step can be restarted
@@ -128,10 +132,11 @@ after a preemption by running the same command again. A failed run leaves `error
 ### Evaluation protocol (per seed, stratified)
 
 - Splits: 20% sealed test set; of the remaining 80%, 10% membership-inference holdout, 10% validation,
-  and the rest (64% of all records) for training.
+  and the rest (64% of all records) for training. LODO selection uses only the seed-0 training and
+  validation splits of the other datasets.
 - TSTR with a random forest (200 trees, balanced class weights) and k-NN (k = 5); F1 at the threshold
   that maximizes F1 on the real validation split (an oracle calibration).
-- δ = min(10⁻⁵, 1/(10·n_train)), split δ/3 per private component.
+- δ = min(10⁻⁵, 1/(10·n_train)), split δ/4 per private component.
 
 ## Using the pipeline on your own data
 
@@ -151,14 +156,18 @@ DATASET_PRESETS["my_dataset"] = DatasetConfig(
     target_col="label",
     id_cols=["id", "internal_ref"],          # dropped before training
     cat_cols=["region", "plan_type"],        # None = auto-infer
+    cat_domains={"region": ["north", "south"], "plan_type": ["basic", "plus"]},   # public category domains
+    public_bounds={"age": (18, 100)},         # documented bounds; other numeric columns get a private range
     log1p_cols=["income"],                   # skewed numeric columns
     int_cols=["age"],                        # rounded after synthesis
     hard_bounds={"age": (18, 100)},          # physical/logical bounds
 )
 ```
 
-GAN, flow and training hyperparameters live in the `Hyperparams` dataclass; per-dataset defaults
-are in `HP_PRESETS`.
+GAN, flow and training hyperparameters live in the `Hyperparams` dataclass (the defaults are the
+end-to-end protocol's global setting); `HP_PRESETS` holds the per-dataset presets of the earlier
+protocol. Without `cat_domains`, use `--encoder data` (the encoder is then fitted on your data and the
+release is not end-to-end private).
 
 ## Data governance (MIMIC-III)
 

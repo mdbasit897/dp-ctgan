@@ -37,7 +37,9 @@ BASELINE_NAMES = {"sn_dpctgan": "DP-CTGAN (SmartNoise)", "sn_patectgan": "PATE-C
                   "smote": r"SMOTE$^\dagger$", "pategan": "PATE-GAN", "dpgan": "DP-GAN", "aim": "AIM"}
 BASELINE_NAMES.update({f"{m}_matched": BASELINE_NAMES[m].replace("(SmartNoise)", "(SmartNoise, matched)")
                        for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
-BASELINE_ORDER = ["sn_dpctgan_matched", "sn_patectgan_matched", "sn_mst_matched", "sn_dpctgan", "sn_patectgan",
+BASELINE_NAMES.update({f"{m}_e2e": BASELINE_NAMES[m] for m in ("sn_dpctgan", "sn_patectgan", "sn_mst")})
+BASELINE_ORDER = ["sn_dpctgan_e2e", "sn_patectgan_e2e", "sn_mst_e2e",
+                  "sn_dpctgan_matched", "sn_patectgan_matched", "sn_mst_matched", "sn_dpctgan", "sn_patectgan",
                   "sn_mst", "pategan", "dpgan", "aim", "ctgan", "tvae", "smote"]
 EPS_TEX = {"nodp": "No-DP", "10": r"$\varepsilon=10$", "3": r"$\varepsilon=3$", "1": r"$\varepsilon=1$",
            "5": r"$\varepsilon=5$"}
@@ -344,12 +346,14 @@ def main():
     # dp mode: privacy budget per component
     bud = df[(df.method == "ours") & (df.config == "combined") & (df.eps != "nodp")]
     if "budget_epsilon_total_rdp" in bud:
-        cols_b = [("budget_epsilon_gan_achieved", "{:.2f}"), ("budget_epsilon_stats", "{:.2f}"),
+        cols_b = [("budget_epsilon_encoder_achieved", "{:.2f}"),
+                  ("budget_epsilon_gan_achieved", "{:.2f}"), ("budget_epsilon_stats", "{:.2f}"),
                   ("budget_epsilon_judge_achieved", "{:.2f}"), ("budget_epsilon_total_basic", "{:.2f}"),
                   ("budget_epsilon_total_rdp", "{:.2f}"), ("budget_stats_rel_noise", "{:.3f}"),
                   ("budget_mm_weight", "{:.2f}"), ("budget_judge_noise_multiplier", "{:.2f}")]
         lines = [r"\begin{tabular}{ll" + "c" * len(cols_b) + "}", r"\toprule",
-                 r"Dataset & $\varepsilon$ & $\varepsilon_{\mathrm{GAN}}$ & $\varepsilon_{\mathrm{stats}}$ & "
+                 r"Dataset & $\varepsilon$ & $\varepsilon_{\mathrm{enc}}$ & $\varepsilon_{\mathrm{GAN}}$ & "
+                 r"$\varepsilon_{\mathrm{stats}}$ & "
                  r"$\varepsilon_{\mathrm{judge}}$ & Total (basic) & Total (RDP) & Moment noise/$n$ & "
                  r"MM weight & Judge $\sigma$ \\", r"\midrule"]
         for ds in datasets:

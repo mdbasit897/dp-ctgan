@@ -36,7 +36,9 @@ BASELINES = {"smote": ["nodp"], "ctgan": ["nodp"], "tvae": ["nodp"], "sn_dpctgan
              "sn_patectgan": ["1", "3", "10"], "sn_mst": ["1", "3", "10"],
              # matched: RareSel-DP's delta, public column bounds, no preprocessing budget, 5 seeds
              "sn_dpctgan_matched": ["1", "3", "10"], "sn_patectgan_matched": ["1", "3", "10"],
-             "sn_mst_matched": ["1", "3", "10"]}
+             "sn_mst_matched": ["1", "3", "10"],
+             # end-to-end: public category domains, public or private ranges within eps (run_baselines.py --e2e)
+             "sn_dpctgan_e2e": ["1", "3", "10"], "sn_patectgan_e2e": ["1", "3", "10"], "sn_mst_e2e": ["1", "3", "10"]}
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--baseline-seeds", type=int, default=3, help="number of seeds the baselines are run with")
@@ -149,7 +151,7 @@ ok(not miss, f"all {len(DATASETS) * len(EPS) * len(ARTIFACTS)} artifact files pr
 
 section(f"5. Baselines ({BLD}/)")
 for meth, eps_l in BASELINES.items():
-    n_seeds = _a.matched_seeds if meth.endswith("_matched") else BL_SEEDS
+    n_seeds = _a.matched_seeds if (meth.endswith("_matched") or meth.endswith("_e2e")) else BL_SEEDS
     want = len(DATASETS) * len(eps_l) * n_seeds
     files = [f for s in range(n_seeds) for f in glob.glob(f"{BLD}/{meth}/*/eps*/seed{s}/metrics.json")]
     errs = glob.glob(f"{BLD}/{meth}/*/eps*/seed*/error.txt")

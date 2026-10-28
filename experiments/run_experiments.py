@@ -10,18 +10,28 @@ Two privacy modes (see dp_ctgan_pipeline.apply_privacy_mode):
   --mode dp      (default) every component that reads real data is covered by epsilon:
                  DP discriminator + Gaussian-mechanism minority mean/std + DP-SGD judge;
                  no feature/correlation/quantile matching; PrivacyGate audit only.
-                 Writes to results_dp/ unless --out is given.
   --mode nonprivate  the non-private variant reported as an upper reference: real-data
                  statistics, feature/correlation matching, random-forest judge and quantile
-                 matching outside the accountant (writes to results/).
+                 matching outside the accountant.
+
+Two protocols:
+  --protocol e2e (default) end-to-end accounted release: public schema (DatasetConfig.cat_domains /
+                 public_bounds), private encoder and column ranges (--encoder dp, 5% of epsilon),
+                 clipping only to released ranges, the same Hyperparams defaults for every dataset plus
+                 overrides chosen WITHOUT the target dataset (tune_lodo.py -> --hp-dir).
+                 --encoder data keeps everything else but fits the encoder on the training data
+                 (the public-encoder assumption), as an ablation.
+                 Default output: results_e2e/ (dp) or results_e2e_nonprivate/.
+  --protocol legacy  the earlier protocol (per-dataset presets, encoder and ranges fitted on the
+                 training data, hparams from tune.py); default output results_dp/ or results/.
 
 Examples
   # smoke test (minutes, tiny settings)
-  python experiments/run_experiments.py --datasets adult --eps 3 --seeds 0 --quick
-  # full grid, split across 3 worker processes (run each in its own tmux window)
-  python experiments/run_experiments.py --shard 0/3 --ablations
-  python experiments/run_experiments.py --shard 1/3 --ablations
-  python experiments/run_experiments.py --shard 2/3 --ablations
+  python experiments/run_experiments.py --datasets adult --eps 3 --seeds 0 --quick --hp-dir none --out results_smoke
+  # full grid with LODO hyperparameters, 8 worker processes
+  for i in 0 1 2 3 4 5 6 7; do
+    python experiments/run_experiments.py --shard $i/8 --ablations --hp-dir results_e2e/hparams_lodo &
+  done
 """
 import argparse
 import json
@@ -74,14 +84,14 @@ def sampler_counts(d):
     return {k: int(d[k][0]) for k in ("n_survivors", "n_selected", "n_padded") if d is not None and len(d.get(k, []))}
 
 
-def make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp, flags, use_qm):
+def make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp, flags, use_qm, post):
     train = splits["train"]
     real_min = train[train[target] == 1].reset_index(drop=True)
     rare, d = model.sample_rare(n_rare, df_real=train, hp=hp, return_diagnostics=True, **flags)
     if use_qm and hp.quantile_blend > 0:
         rare = P.quantile_match(rare, real_min, cont_cols, blend=hp.quantile_blend, orig_df=train)
     rare[target] = 1
-    rare = P.postprocess_synthetic(rare, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
+    rare = post(rare)
     # dp mode: the gate only measures near-copies (filtering would be outside the budget)
     rare, stats = P.privacy_realism_filter(rare, real_min, feat, desired_n=n_rare, label="rare",
                                            max_ref=hp.privacy_max_ref, return_stats=True, verbose=False,
@@ -100,14 +110,20 @@ def run_one(dataset, eps, seed, args):
     splits = make_splits(df, target, seed)
     train = splits["train"]
 
-    overrides, hp_source = {}, "preset"
+    e2e = args.protocol == "e2e"
+    overrides, hp_source = {}, ("global defaults" if e2e else "preset")
     hp_file = os.path.join(args.hp_dir, f"{dataset}_eps{eps_tag(eps)}.json")
-    if args.hp_dir.lower() != "none" and os.path.exists(hp_file):
+    if args.hp_dir.lower() != "none":
+        if not os.path.exists(hp_file):
+            raise FileNotFoundError(f"{hp_file} not found (run tune_lodo.py, or pass --hp-dir none for the defaults)")
         overrides, hp_source = json.load(open(hp_file))["best_params"], hp_file
-        print(f"  using tuned hyperparameters from {hp_file}: {overrides}")
+        print(f"  using hyperparameters from {hp_file}: {overrides}")
     else:
-        print("  using the dataset preset hyperparameters (no tuned file)")
-    hp = P.apply_privacy_mode(P.hyperparams_for(dataset, overrides), args.mode)
+        print(f"  using the {hp_source} (no tuning)")
+    base = P.global_hyperparams(overrides) if e2e else P.hyperparams_for(dataset, overrides)
+    hp = P.apply_privacy_mode(base, args.mode)
+    hp.encoder = args.encoder if e2e else "data"
+    schema = P.public_schema(cfg, df.columns, target, cat_cols) if hp.encoder == "dp" else None
     if args.judge:
         hp.judge_type = args.judge
     if args.quick:
@@ -121,7 +137,7 @@ def run_one(dataset, eps, seed, args):
         "n_train": len(train), "n_val": len(splits["val"]), "n_holdout": len(splits["holdout"]),
         "n_test": len(splits["test"]), "minority_rate_test": float(splits["test"][target].mean()),
         "n_features": len(feat), "n_categorical": len(cat_cols), "hp": asdict(hp), "hp_source": hp_source,
-        "quick": args.quick, "mode": args.mode}}
+        "quick": args.quick, "mode": args.mode, "protocol": args.protocol, "encoder": hp.encoder}}
     save_art = seed == args.artifact_seed
 
     t = time.time()
@@ -130,8 +146,13 @@ def run_one(dataset, eps, seed, args):
 
     t = time.time()
     model = P.DPCTGAN(epsilon=eps, hp=hp, verbose=True)
-    model.fit(train, cat_cols, target, ds_name=dataset)
+    model.fit(train, cat_cols, target, ds_name=dataset, schema=schema)
     timings["gan_train"] = time.time() - t
+    # e2e: clip to the released ranges and the public domains only; legacy: training-data ranges
+    bounds, cat_sizes = model.release_bounds() if e2e else (None, None)
+    post = lambda d: P.postprocess_synthetic(d, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds,
+                                             bounds=bounds, cat_sizes=cat_sizes)
+    R["meta"]["encoder_info"] = model.encoder_info
     R["meta"]["dp"] = model.dp_info
     R["meta"]["achieved_epsilon"] = None if eps is None else float(model.epsilon_total)
     R["meta"]["dp_budget"] = model.budget
@@ -139,8 +160,7 @@ def run_one(dataset, eps, seed, args):
     R["meta"]["judge"] = model.judge.info if model.judge is not None else {"kind": "rf", "private": False}
 
     t = time.time()
-    common = model.sample_common(len(train))
-    common = P.postprocess_synthetic(common, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
+    common = post(model.sample_common(len(train)))
     gate = {}
     common, gate["common"] = P.privacy_realism_filter(common, train, feat, desired_n=len(train), label="common",
                                                       max_ref=hp.privacy_max_ref, return_stats=True,
@@ -155,7 +175,7 @@ def run_one(dataset, eps, seed, args):
     n_rare = max(200, int(n_min * hp.rare_multiplier))
     t = time.time()
     rare, gate["rare"], diag = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
-                                         {}, True)
+                                         {}, True, post)
     timings["sample_rare"] = time.time() - t
     combined = pd.concat([common, rare], ignore_index=True)[df.columns]
     R["meta"]["n_rare"] = int(len(rare))
@@ -178,8 +198,7 @@ def run_one(dataset, eps, seed, args):
     if args.ablations:
         R["ablations"] = {}
         t = time.time()
-        plain = model.sample_minority_plain(n_rare)
-        plain = P.postprocess_synthetic(plain, train, target, cat_cols, cfg.int_cols, cfg.hard_bounds)
+        plain = post(model.sample_minority_plain(n_rare))
         if hp.privacy_filter_enabled:
             plain = P.privacy_realism_filter(plain, train[train[target] == 1], feat, desired_n=n_rare,
                                              max_ref=hp.privacy_max_ref, verbose=False)
@@ -192,7 +211,7 @@ def run_one(dataset, eps, seed, args):
             elif flags.get("judge") == "rf_nonprivate":
                 flags["judge"] = judges.setdefault("rf", P.RFJudge(target, feat).fit(train))
             variants[name], _, d_v = make_rare(model, n_rare, splits, target, cat_cols, cont_cols, feat, cfg, hp,
-                                               flags, use_qm)
+                                               flags, use_qm, post)
             counts[name] = sampler_counts(d_v)
         for name, rv in variants.items():
             comb_v = pd.concat([common, rv], ignore_index=True)[df.columns]
@@ -229,8 +248,14 @@ def main():
     ap.add_argument("--quick", action="store_true", help="tiny settings for a smoke test")
     ap.add_argument("--shard", default="0/1", help="i/N: run every N-th job starting at i")
     ap.add_argument("--data-dir", default=None, help="directory with the prepared CSVs (default: ./data)")
-    ap.add_argument("--hp-dir", default="results/hparams",
-                    help="tuned hyperparameters from tune.py; 'none' = dataset presets (untuned grid)")
+    ap.add_argument("--protocol", choices=["e2e", "legacy"], default="e2e",
+                    help="e2e (default): end-to-end accounted release; legacy: the earlier protocol")
+    ap.add_argument("--encoder", choices=["dp", "data"], default="dp",
+                    help="e2e only: dp (default) = private encoder and ranges; data = fitted on the training "
+                         "data outside epsilon (public-encoder ablation)")
+    ap.add_argument("--hp-dir", default=None,
+                    help="hyperparameter files <ds>_eps<e>.json; 'none' = no tuning. Default: "
+                         "results_e2e/hparams_lodo (e2e) or results/hparams (legacy)")
     ap.add_argument("--mode", choices=["dp", "nonprivate"], default="dp",
                     help="dp (default): RareSel-DP; nonprivate: the non-private variant (upper reference)")
     ap.add_argument("--judge", choices=["mlp", "disc", "rf"], default=None,
@@ -239,9 +264,15 @@ def main():
     ap.add_argument("--delta", type=float, default=None)
     ap.add_argument("--artifact-seed", type=int, default=0, help="seed whose synthetic data/scores are saved for figures")
     args = ap.parse_args()
+    if args.hp_dir is None:
+        args.hp_dir = "results_e2e/hparams_lodo" if args.protocol == "e2e" else "results/hparams"
     if args.out is None:
-        args.out = "results_dp" if args.mode == "dp" else "results"
-    print(f"mode={args.mode}  out={args.out}")
+        if args.protocol == "e2e":
+            args.out = "results_e2e" if args.mode == "dp" else "results_e2e_nonprivate"
+        else:
+            args.out = "results_dp" if args.mode == "dp" else "results"
+    print(f"protocol={args.protocol}  mode={args.mode}  encoder={args.encoder if args.protocol == 'e2e' else 'data'}"
+          f"  hp_dir={args.hp_dir}  out={args.out}")
 
     jobs = [(d, parse_eps(e), s) for d in args.datasets for e in args.eps for s in args.seeds]
     i, n = map(int, args.shard.split("/"))
